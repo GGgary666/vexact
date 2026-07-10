@@ -95,7 +95,22 @@ class ServerAdapter(BaseRollout):
         weights: Generator[tuple[str, torch.Tensor], None, None],
         **kwargs,  # noqa: ARG002
     ):
-        """Update model weights via bucketed IPC transfer to inference workers."""
+        """Update model weights via bucketed IPC transfer to inference workers.
+
+        When QAT is enabled and the training-side weight_quantizer_map is cached,
+        weights are folded via the actor's weight_quantizer before being sent to
+        rollout (NeMo-RL QARL-style). This avoids per-bucket fold overhead on the
+        rollout side and ensures train/rollout distribution consistency.
+        """
+        from vexact.quantization.fold import (
+            fold_weights_generator,
+            get_training_weight_quantizer_map,
+        )
+
+        wq_map = get_training_weight_quantizer_map()
+        if wq_map:
+            weights = fold_weights_generator(weights, wq_map)
+
         future = None
         if self.rollout_rank == 0:
             future = self._get_server_handle().receive_weights.remote()

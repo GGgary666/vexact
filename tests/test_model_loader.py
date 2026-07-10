@@ -35,7 +35,10 @@ def device():
 
 @pytest.fixture(scope="module")
 def model_path() -> str:
-    return os.environ["VEXACT_TESTS_MODEL_PATH"]
+    path = os.environ.get("VEXACT_TESTS_MODEL_PATH")
+    if not path:
+        pytest.skip("VEXACT_TESTS_MODEL_PATH is required for real HF model loader tests")
+    return path
 
 
 @pytest.fixture(scope="module")
@@ -191,3 +194,45 @@ def test_pp_wrapper_load_weights_accepts_model_prefix_keys():
     assert torch.equal(base_model.embed_tokens.weight, new_embed)
     assert torch.equal(base_model.proj.weight, new_proj)
     assert torch.equal(lm_head.weight, new_lm_head)
+
+
+def test_custom_load_weights_prefold_only_folds_updated_weights():
+    class DummyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.p1 = nn.Parameter(torch.zeros(2, 2))
+            self.p2 = nn.Parameter(torch.zeros(2, 2))
+
+        def load_weights(self, weight_iterator, tied_weight_keys):
+            assert tied_weight_keys == []
+            params = dict(self.named_parameters())
+            for name, weight in weight_iterator:
+                params[name].data.copy_(weight)
+
+    class CountingQuantizer:
+        is_enabled = True
+
+        def __init__(self, delta):
+            self.delta = delta
+            self.calls = 0
+
+        def __call__(self, x):
+            self.calls += 1
+            return x + self.delta
+
+    model = DummyModel()
+    config = PretrainedConfig(tie_word_embeddings=False)
+    q1 = CountingQuantizer(delta=0.5)
+    q2 = CountingQuantizer(delta=10.0)
+
+    load_weights_from_weight_iterator(
+        model,
+        config,
+        [("p1", torch.ones(2, 2))],
+        weight_quantizer_map={"p1": q1, "p2": q2},
+    )
+
+    assert torch.all(model.p1 == 1.5)
+    assert torch.all(model.p2 == 0.0)
+    assert q1.calls == 1
+    assert q2.calls == 0

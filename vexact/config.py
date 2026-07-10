@@ -17,6 +17,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Literal, Optional
 
+from vexact.quantization import QATConfig
+
 
 logger = logging.getLogger(__name__)
 
@@ -305,6 +307,8 @@ class VeXactConfig:
     cache: CacheConfig = field(default_factory=CacheConfig)
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
     driver: DriverConfig = field(default_factory=DriverConfig)
+    # Optional QAT / fake-quantization config. ``None`` means no quantization.
+    quantization: Optional[QATConfig] = None
 
     def __post_init__(self):
         # Generate driver IPC addresses using world_size from parallel config

@@ -5,7 +5,7 @@ description = "TODO"
 requires-python = ">=3.12, <3.13"
 dependencies = [
     "transformers",
-    "torch_memory_saver==0.0.9; platform_machine != 'aarch64'",
+    "torch_memory_saver>=0.0.9.post1; platform_machine != 'aarch64'",
     "pyzmq>=27.1.0",
     "msgspec",
 ]
@@ -42,6 +42,12 @@ veomni = [
     # users picking up the veomni extra resolve to the same version VeOmni
     # tests/develops against.
     "transformers==5.9.0",
+]
+qat = [
+    # NVIDIA Model-Optimizer backs the w4a4 (NVFP4) fake quantization used by
+    # both the training-side (VeOmni FSDP) and rollout-side (VeXact) QAT hooks.
+    # Version tracks the pin used by NeMo-RL's modelopt integration.
+    "nvidia-modelopt>=0.44.0",
 ]
 
 [build-system]

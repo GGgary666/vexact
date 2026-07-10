@@ -27,6 +27,7 @@ from transformers.utils.hub import cached_file, get_checkpoint_shard_files
 
 from vexact.config import PPInfo
 from vexact.models.register import register_models as _register_models
+from vexact.quantization import QATConfig
 from vexact.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 
@@ -88,6 +89,7 @@ def load_weights_from_weight_iterator(
     model: nn.Module,
     model_config: PretrainedConfig,
     weight_iterator: Iterable[tuple[str, torch.Tensor]],
+    weight_quantizer_map: Optional[dict] = None,
 ):
     """
     All the model loading should go through this API to properly select the model loading method
@@ -98,26 +100,53 @@ def load_weights_from_weight_iterator(
     if getattr(model_config, "tie_word_embeddings", False):
         tied_weight_keys = getattr(model, "_tied_weights_keys", list())
 
+    if weight_quantizer_map is None:
+        weight_quantizer_map = getattr(model, "_vexact_weight_quantizer_map", None)
+        if weight_quantizer_map is None:
+            inner = getattr(model, "model", None)
+            if inner is not None:
+                weight_quantizer_map = getattr(inner, "_vexact_weight_quantizer_map", None)
+
     if hasattr(model, "load_weights"):
         logger.info(f"Found custom load_weights method in model instance, {tied_weight_keys=}")
-        model.load_weights(weight_iterator, tied_weight_keys)
+        if weight_quantizer_map:
+            # Bucketed rollout sync calls the loader once per received bucket.
+            # Materialize this small bucket so we can fold only the weights that
+            # were just updated, instead of re-folding the entire model after
+            # every bucket/chunk.
+            weight_items = list(weight_iterator)
+            model.load_weights(iter(weight_items), tied_weight_keys)
+        else:
+            weight_items = None
+            model.load_weights(weight_iterator, tied_weight_keys)
+        if weight_quantizer_map:
+            from vexact.quantization.fold import fold_model_weights_in_place
+
+            updated_map = {
+                name: weight_quantizer_map[name]
+                for name, _ in weight_items
+                if name in weight_quantizer_map
+            }
+            folded = fold_model_weights_in_place(model, updated_map)
+            logger.info(
+                "Applied rollout weight pre-folding after custom load_weights "
+                "(%d/%d updated weight(s)).",
+                folded,
+                len(updated_map),
+            )
     else:
-        logger.info("Using default weight loading method")
-        parameters = dict(model.named_parameters())
-        embed_tokens_weight = None
-        for full_name, loaded_weight in weight_iterator:
-            if full_name == "model.embed_tokens.weight":
-                embed_tokens_weight = loaded_weight
+        from vexact.quantization.fold import load_weights_with_optional_prefold
 
-            if full_name in parameters:
-                parameters[full_name].data.copy_(loaded_weight)
-
-        for param_name in tied_weight_keys:
-            if param_name in parameters:
-                if "model.embed_tokens.weight" in parameters:
-                    parameters[param_name].data = parameters["model.embed_tokens.weight"].data
-                elif embed_tokens_weight is not None:
-                    parameters[param_name].data.copy_(embed_tokens_weight)
+        logger.info(
+            "Using default weight loading method"
+            + (" with rollout weight pre-folding" if weight_quantizer_map else "")
+        )
+        load_weights_with_optional_prefold(
+            model,
+            weight_iterator,
+            weight_quantizer_map=weight_quantizer_map,
+            tied_weight_keys=tied_weight_keys,
+        )
 
 
 def init_parameters(module: nn.Module, dtype: torch.dtype, device: torch.device):
@@ -277,11 +306,19 @@ class TransformersForCausalLM(nn.Module):
 
 
 class ModelCreator:
-    def __init__(self, config: PretrainedConfig, model_path: str, device: torch.device, pp_info: PPInfo):
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        model_path: str,
+        device: torch.device,
+        pp_info: PPInfo,
+        qat_config: Optional[QATConfig] = None,
+    ):
         self._pp_info = pp_info
         self._model_path = model_path
         self._config = config
         self._device = device
+        self._qat_config = qat_config
         with init_on_device_without_buffers("meta"):
             self._causal_model: PreTrainedModel = AutoModelForCausalLM.from_config(
                 self._config,
@@ -309,6 +346,14 @@ class ModelCreator:
 
         load_weights_from_weight_path(self._causal_model, self._config, self._model_path)
 
+        # Insert modelopt fake quantizers *after* real weights are loaded and
+        # *before* eval()/PP-wrap, mirroring the training side which quantizes
+        # the freshly-built HF model prior to FSDP wrap. For NVFP4 (w4a4) with
+        # calibrate=False this only inserts quantizer modules (dynamic amax),
+        # so subsequent FSDP->rollout weight syncs still target ``.weight`` by
+        # the same names and remain compatible.
+        self._apply_qat()
+
         torch.cuda.empty_cache()
         self._causal_model.eval()
         if torch.cuda.is_available():
@@ -332,6 +377,57 @@ class ModelCreator:
             return pp_model
         else:
             return self._causal_model
+
+    def _apply_qat(self):
+        """Apply rollout QAT: folded weights from training; optional activation quant.
+
+        Weight path is always training-side fold (never live ``weight_quantizer``
+        on rollout):
+
+        * ``w4a16``: skip quantizer insertion; model stays plain BF16 Linear.
+        * ``w4a4``: insert modelopt modules, then disable all weight quantizers
+          so only ``input_quantizer`` remains for activation fake-quant.
+        """
+        qat_config = self._qat_config
+        if qat_config is None or not qat_config.enable:
+            return
+
+        if qat_config.mode == "w4a16":
+            logger.info(
+                "[VEXACT-QAT] Skipping rollout quantizer insertion: w4a16 + "
+                "training-side weight fold. Model stays as pure BF16 nn.Linear. "
+                "Folded weights will arrive from ServerAdapter.update_weights()."
+            )
+            return
+
+        from vexact.quantization import quantize_model
+        from vexact.quantization.fold import (
+            audit_rollout_quant_state,
+            disable_weight_quantizers,
+        )
+
+        logger.info(
+            "[VEXACT] Applying QAT to rollout model for activation quant only "
+            f"(mode={qat_config.mode}, cfg={qat_config.resolved_cfg_name()}). "
+            "Weight quantizers will be disabled; folded weights come from training."
+        )
+        quantize_model(self._causal_model, qat_config)
+        disabled = disable_weight_quantizers(self._causal_model)
+        stats = audit_rollout_quant_state(
+            self._causal_model, context="after disable weight_quantizer (w4a4 fold path)"
+        )
+        logger.info(
+            "[VEXACT-QAT] Rollout w4a4 fold path: disabled %d weight_quantizer(s); "
+            "input_quantizer_enabled=%d.",
+            disabled,
+            stats["input_quantizer_enabled"],
+        )
+        if stats["weight_quantizer_enabled"] > 0:
+            raise RuntimeError(
+                "[VEXACT-QAT] Rollout still has "
+                f"{stats['weight_quantizer_enabled']} enabled weight_quantizer(s). "
+                "Live weight fake-quant on rollout is not supported."
+            )
 
     def _ensure_rotary_embeddings_on_device(self):
         """Move RoPE buffers to target device to avoid host->device copies during CUDA graph capture."""

@@ -68,7 +68,14 @@ class WorkerProcManager:
         self.world_size = config.parallel.world_size
         self._procs: list[BaseProcess] = []
         self._death_writers: list[Connection] = []
-        self._finalizer = weakref.finalize(self, _shutdown_procs, self._procs, self._death_writers)
+        self._closing = threading.Event()
+        self._finalizer = weakref.finalize(
+            self,
+            _shutdown_procs,
+            self._procs,
+            self._death_writers,
+            self._closing,
+        )
 
         ctx = multiprocessing.get_context("spawn")
         ready_readers: list[Connection] = []
@@ -101,8 +108,17 @@ class WorkerProcManager:
                 raise RuntimeError(f"Worker rank={rank} failed to start")
             logger.info(f"Worker rank={rank} ready")
 
+        self._monitor_thread = threading.Thread(
+            target=_monitor_worker_procs,
+            args=(self._procs, self._closing),
+            daemon=True,
+            name="WorkerProcMonitor",
+        )
+        self._monitor_thread.start()
+
     def close(self):
         """Shutdown all worker processes."""
+        self._closing.set()
         self._finalizer()
 
     @property
@@ -157,8 +173,31 @@ class WorkerProcManager:
                 proxy.stop()
 
 
-def _shutdown_procs(procs: list[BaseProcess], death_writers: list[Connection]):
+def _monitor_worker_procs(procs: list[BaseProcess], closing: threading.Event):
+    """Fail fast if a managed worker subprocess exits unexpectedly.
+
+    A dead DriverWorkerProxy cannot answer ZMQ requests, so leaving the Ray
+    actor alive turns a real subprocess crash into an unbounded rollout hang.
+    """
+    while not closing.wait(timeout=1.0):
+        for proc in procs:
+            if proc.exitcode is None:
+                continue
+            if closing.is_set():
+                return
+            logger.critical(
+                "Worker subprocess %s pid=%s exited unexpectedly with exitcode=%s; "
+                "terminating parent process to avoid a silent request hang.",
+                proc.name,
+                proc.pid,
+                proc.exitcode,
+            )
+            os._exit(1)
+
+
+def _shutdown_procs(procs: list[BaseProcess], death_writers: list[Connection], closing: threading.Event):
     """Cleanup function for weak reference finalizer."""
+    closing.set()
     for writer in death_writers:
         writer.close()
 

@@ -110,7 +110,8 @@ class VeXactServer:
         logger.info(
             f"VeXactServer initialized (replica_rank={replica_rank}, node_rank={node_rank}, "
             f"{get_visible_devices_keyword()}: {cuda_visible_devices}, "
-            f"gpus_per_node={gpus_per_node}, nnodes={nnodes})"
+            f"gpus_per_node={gpus_per_node}, nnodes={nnodes}, "
+            f"max_model_len={self.config.max_model_len})"
         )
 
     def get_server_address(self):
@@ -135,18 +136,45 @@ class VeXactServer:
             VeXactConfig,
         )
         from vexact.engine import VeXact
+        from vexact.quantization import QATConfig
 
         engine_kwargs = self.config.engine_kwargs.pop("vexact", {})
         logger.info(f"Extra {engine_kwargs=}")
 
         attn_impl = engine_kwargs.pop("attn_impl", os.environ.get("INFER_FA_IMPL", "fa-invariant"))
+
+        # QAT / fake quantization config for the rollout side. Provided via
+        # ``++actor_rollout_ref.rollout.engine_kwargs.vexact.qat.*`` and must
+        # match the training-side config (see fsdp_enable_qat.py) so both sides
+        # insert identical quantizers. Returns None when disabled.
+        qat_config = QATConfig.from_dict(engine_kwargs.pop("qat", None))
+        if qat_config is not None:
+            logger.info(f"[vexact] Rollout QAT enabled: {qat_config}")
+
+        rollout_enforce_eager = self.config.enforce_eager
+        if qat_config is not None and qat_config.enable and not rollout_enforce_eager:
+            # w4a16: plain BF16 Linear after training-side fold → CUDA graph OK.
+            # w4a4: keeps input_quantizer modules → force eager.
+            if qat_config.mode == "w4a16":
+                logger.info(
+                    "[vexact] QAT rollout: keeping CUDA graph enabled (w4a16; "
+                    "rollout model stays as pure BF16 nn.Linear with folded weights)."
+                )
+            else:
+                logger.warning(
+                    "[vexact] QAT rollout: forcing enforce_eager=True because CUDA graph "
+                    "capture/replay is unreliable with modelopt input_quantizer modules."
+                )
+                rollout_enforce_eager = True
+
         vexact_config = VeXactConfig(
             model=ModelConfig(
                 model_path=self.model_config.local_path,
                 attn_impl=attn_impl,
+                max_model_len=self.config.max_model_len,
                 enable_batch_invariant=True,
                 enable_memory_saver=self.config.free_cache_engine,
-                enforce_eager=self.config.enforce_eager,
+                enforce_eager=rollout_enforce_eager,
                 use_fp32_logits=self.model_config.use_fused_kernels,
             ),
             parallel=ParallelConfig(
@@ -169,6 +197,7 @@ class VeXactServer:
                 output_path=self.config.profiler.save_path,
                 profile_all_ranks=True,
             ),
+            quantization=qat_config,
         )
 
         self.engine = VeXact(vexact_config)
