@@ -82,7 +82,8 @@ inference_outputs*
 outputs/
 verl_rollout_profile_gsm8k
 
-# local-only experiment scripts (not for upstream)
-examples/getting_started/run_qwen3_1b7_gsm8k.sh
-examples/getting_started/run_qwen3_1b7_gsm8k_qat_w4a16.sh
-examples/getting_started/run_qwen3_1b7_gsm8k_qat_w4a4.sh
+# local-only scripts / experiments (not for upstream)
+exp_scripts/
+env_setup.sh
+update_code_repo.sh
+
