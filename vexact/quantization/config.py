@@ -29,11 +29,15 @@ modelopt does not ship a built-in "NVFP4 weight-only, all layers" constant
 ``w4a16`` is built from ``NVFP4_DEFAULT_CFG`` by merging an explicit
 ``*input_quantizer`` disable in :func:`vexact.quantization.quantize.resolve_quant_cfg`,
 unless ``quant_cfg`` is set explicitly. This keeps ``w4a16`` on the same NVFP4 E2M1
-numerics as ``w4a4`` (so folding/export stays uniform) while only quantizing weights. Both the
-weight and (when enabled) activation quantizers use dynamic block scaling
-(``block_sizes={"type": "dynamic", ...}``), i.e. the scale is recomputed fresh
-from the live tensor on every forward rather than a frozen calibrated value,
-so there is no cross-refit ``amax`` staleness to worry about for either mode.
+numerics as ``w4a4`` (so folding/export stays uniform) while only quantizing weights.
+
+Calibration / amax sync (train–rollout 0 mismatch):
+
+- ``w4a4``: **MUST** calibrate at init so ``input_quantizer.amax`` is materialized,
+  then **MUST** sync that amax to rollout on every ``update_weights``. Setting
+  ``calibrate=False`` is illegal (dynamic activation scales diverge across sides).
+- ``w4a16``: no activation quantizer; init calibration is **not** required. 0
+  mismatch comes from training-side ``weight_quantizer`` fold into BF16.
 
 ``quant_cfg`` may be set to override the mode mapping with any modelopt config
 constant name (e.g. ``"INT4_BLOCKWISE_WEIGHT_ONLY_CFG"``) or a modelopt PTQ
@@ -47,6 +51,9 @@ never runs live ``weight_quantizer``. For ``w4a16`` rollout stays plain Linear;
 for ``w4a4`` rollout only keeps ``input_quantizer`` (activation) modules.
 ``prefold_weights`` is retained for config compatibility but is always treated
 as enabled when QAT is on.
+
+Offline deployment export (real NVFP4 HF for vLLM ``modelopt_fp4``) is separate
+from online fold: use :mod:`vexact.quantization.export` / ``scripts/export_qat_to_hf.py``.
 """
 
 from __future__ import annotations
@@ -85,16 +92,24 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return val.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_flag_explicit(name: str) -> Optional[bool]:
+    """Return True/False if ``name`` is set, else ``None``."""
+    val = os.environ.get(name)
+    if val is None:
+        return None
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
 @dataclass
 class QATConfig:
     """Fake-quantization (QAT) configuration shared by the training and rollout sides.
 
     Both sides construct the *same* ``QATConfig`` so the inserted modelopt
     quantizers are identical, which is what keeps the training and inference
-    numerics aligned. For NVFP4 (``w4a4``/``w4a16``) with ``calibrate=False``
-    the quantizer ``amax`` is recomputed dynamically on every forward, so no
-    calibration data or ``amax`` synchronization is required between the two
-    sides.
+    numerics aligned.
+
+    For ``w4a4``, calibration is mandatory and ``input_quantizer.amax`` must be
+    synced to rollout. For ``w4a16``, calibration is optional (default off).
     """
 
     enable: bool = False
@@ -103,11 +118,9 @@ class QATConfig:
     # overrides the ``mode`` -> config mapping.
     quant_cfg: Optional[str] = None
     ignore_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_IGNORE_PATTERNS))
-    # When False (default), skip calibration so activation amax is dynamic and
-    # train/infer stay consistent without amax sync. When True, a calibration
-    # forward loop must be supplied (see quantize_model); this yields a static
-    # amax and would require amax synchronization for exact alignment.
-    calibrate: bool = False
+    # ``None`` resolves to mode default: True for w4a4, False for w4a16.
+    # w4a4 + False raises (train/rollout activation mismatch).
+    calibrate: Optional[bool] = None
     # Optional calibration knobs, only used when calibrate=True and a real
     # forward loop is not otherwise supplied.
     calib_size: int = 512
@@ -130,12 +143,26 @@ class QATConfig:
             )
         if self.ignore_patterns is None:
             self.ignore_patterns = list(DEFAULT_IGNORE_PATTERNS)
+        if self.calibrate is None:
+            # w4a4 must calibrate for activation amax; w4a16 does not need it.
+            self.calibrate = self.mode == "w4a4"
+        if self.enable and self.mode == "w4a4" and not self.calibrate:
+            raise ValueError(
+                "QATConfig: mode='w4a4' requires calibrate=True for train/rollout "
+                "0 mismatch (static input_quantizer.amax + refit sync). "
+                "calibrate=False is not allowed for w4a4."
+            )
         if self.prefold_weights is False:
             # Live rollout weight quantizers were removed; fold is mandatory.
             logger.warning(
                 "[vexact-qat] prefold_weights=False is ignored; training-side "
                 "weight fold is mandatory (rollout never runs live weight_quantizer)."
             )
+
+    @property
+    def effective_calibrate(self) -> bool:
+        """Whether calibration runs at quantize time (always True for enabled w4a4)."""
+        return bool(self.calibrate)
 
     @property
     def effective_prefold_weights(self) -> bool:
@@ -192,8 +219,9 @@ class QATConfig:
         if ignore is not None and ignore.strip():
             kwargs["ignore_patterns"] = [p.strip() for p in ignore.split(",") if p.strip()]
 
-        if os.environ.get(f"{prefix}CALIBRATE") is not None:
-            kwargs["calibrate"] = _env_flag(f"{prefix}CALIBRATE", False)
+        calibrate = _env_flag_explicit(f"{prefix}CALIBRATE")
+        if calibrate is not None:
+            kwargs["calibrate"] = calibrate
 
         calib_size = os.environ.get(f"{prefix}CALIB_SIZE")
         if calib_size and calib_size.strip():

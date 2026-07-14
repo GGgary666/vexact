@@ -86,11 +86,15 @@ def _weight_for_training_side_fold(weight: torch.Tensor) -> torch.Tensor:
 def fold_weights_generator(
     weights: Iterable[tuple[str, torch.Tensor]],
     wq_map: dict[str, Any],
+    stats: Optional[dict[str, int]] = None,
 ) -> Iterable[tuple[str, torch.Tensor]]:
     """Wrap a weights generator to fold each weight via its paired quantizer.
 
     Float32 sender weights are cast to bfloat16 before folding so the QDQ source
     matches live actor Parameters.
+
+    If ``stats`` is provided, populate it with fold counters and skip the legacy
+    INFO log (caller is expected to emit a step-level summary).
     """
     folded_count = 0
     total_count = 0
@@ -109,6 +113,13 @@ def fold_weights_generator(
         elif name.endswith(".weight") and "norm" not in name and "embed" not in name:
             unmatched += 1
         yield name, weight
+
+    if stats is not None:
+        stats["folded"] = folded_count
+        stats["total"] = total_count
+        stats["unmatched_linearish"] = unmatched
+        stats["cast_fp32_to_bf16"] = cast_to_bf16_count
+        return
 
     extra = ""
     if unmatched:

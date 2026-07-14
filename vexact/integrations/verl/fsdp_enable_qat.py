@@ -28,6 +28,14 @@ verl's Hydra config; the launcher script exports the same values that the
 rollout side receives via ``engine_kwargs.vexact.qat`` so both sides insert
 identical quantizers.
 
+Optional Cross-Precision Alignment (CPA): after a successful W4A4 QAT install,
+set ``VEXACT_CPA_ENABLE=1`` (and optionally ``VEXACT_CPA_COEF``, default
+``0.001``; ``VEXACT_CPA_LOSS_TYPE`` in ``{low_var_kl,mse,abs_logprob}``,
+default ``low_var_kl``) to also patch ``VeOmniEngineWithLMHead.forward_step`` with a BF16
+teacher alignment loss. No extra ``external_lib`` entry is required -- keep
+mounting this module (or ``fsdp_enable_qat`` alone). CPA refuses to start unless
+QAT is enabled with ``mode=w4a4``.
+
 Usage (typically alongside the batch-invariant hook):
 
     actor_rollout_ref.model.external_lib=vexact.integrations.verl.fsdp_enable_invariant,vexact.integrations.verl.fsdp_enable_qat
@@ -58,11 +66,11 @@ Meta-device / FSDP2 subtlety:
     *after* ``load_weights_from_weight_path``).
 
 Notes:
-    - For NVFP4 (``w4a4``/``w4a16``) with ``calibrate=False`` the enabled
-      quantizers use dynamic block scaling recomputed per forward, so no
-      calibration data or amax synchronization is required between training
-      and rollout. Quantization must still happen after real weights are
-      materialized (see meta-device subtlety above).
+    - ``w4a4`` must calibrate at init and cache ``input_quantizer`` amax for
+      refit sync (train/rollout 0 mismatch). ``w4a16`` does not require
+      calibration; 0 mismatch comes from training-side weight fold.
+      Quantization must still happen after real weights are materialized
+      (see meta-device subtlety above).
     - Any worker process that imports this module gets the QAT hook. verl's
       default schema has no ``actor_rollout_ref.ref.model.external_lib``; ref
       deep-copies ``actor_rollout_ref.model`` (including ``external_lib``).
@@ -188,7 +196,13 @@ def _apply_qat(model, qat_config: QATConfig, context: str):
     # Build and cache the training-side weight_quantizer_map so that
     # ServerAdapter.update_weights() can fold weights before sending them to
     # rollout. Rollout never runs live weight_quantizer (w4a16: plain Linear;
-    # w4a4: input_quantizer only).
+    # w4a4: input_quantizer only). For w4a4 also cache input_quantizer map and
+    # assert amax was materialized by calibration.
+    from vexact.quantization.amax_sync import (
+        assert_input_amax_materialized,
+        build_input_quantizer_map,
+        set_training_input_quantizer_map,
+    )
     from vexact.quantization.fold import (
         build_weight_quantizer_map,
         set_training_weight_quantizer_map,
@@ -207,6 +221,30 @@ def _apply_qat(model, qat_config: QATConfig, context: str):
             "[vexact-qat] Training model was quantized but no weight_quantizer "
             "map was built. Training-side fold will be disabled."
         )
+
+    iq_map = build_input_quantizer_map(model)
+    if iq_map:
+        try:
+            n_amax = assert_input_amax_materialized(model)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"[vexact-qat] w4a4 calibration did not materialize input amax "
+                f"({context}). Aborting to avoid train/rollout mismatch."
+            ) from exc
+        set_training_input_quantizer_map(iq_map)
+        logger.info(
+            "[vexact-qat] Cached training-side input_quantizer_map "
+            "(%d quantizer(s), %d amax buffer(s)) for refit sync.",
+            len(iq_map),
+            n_amax,
+        )
+    else:
+        set_training_input_quantizer_map(None)
+        if qat_config.mode == "w4a4":
+            logger.warning(
+                "[vexact-qat] mode=w4a4 but no enabled input_quantizer found after "
+                "quantize; activation amax sync will be skipped."
+            )
 
 
 def _wrap_build_foundation_model(orig_fn, qat_config: QATConfig):
@@ -350,14 +388,45 @@ def _patch_all_weight_loaders(qat_config: QATConfig) -> int:
     return patched
 
 
+def maybe_enable_cpa_after_qat(qat_installed: bool, qat_config: QATConfig) -> bool:
+    """Install CPA after QAT when ``VEXACT_CPA_ENABLE=1``.
+
+    Fail-fast rules:
+      * CPA enable requires a successful QAT hook install.
+      * CPA enable requires ``qat_config.enable`` and ``mode == "w4a4"``.
+    """
+    from vexact.integrations.verl import fsdp_enable_cpa
+    from vexact.quantization.cpa import CPAConfig
+
+    cpa_config = CPAConfig.from_env()
+    if not cpa_config.enable:
+        return False
+
+    if not qat_installed or not qat_config.enable:
+        raise RuntimeError(
+            "[vexact-cpa] VEXACT_CPA_ENABLE=1 requires a successful W4A4 QAT hook "
+            "(VEXACT_QAT_ENABLE=1). QAT was not installed."
+        )
+    if qat_config.mode != "w4a4":
+        raise RuntimeError(
+            f"[vexact-cpa] CPA currently supports only mode='w4a4' "
+            f"(got mode={qat_config.mode!r})."
+        )
+    return fsdp_enable_cpa.enable_training_cpa(cpa_config)
+
+
 def enable_training_qat() -> bool:
     """Enable the training-side QAT hook based on ``VEXACT_QAT_*`` env vars.
 
     Returns True if quantization was enabled and the patch was installed.
+    When ``VEXACT_CPA_ENABLE=1``, also installs the CPA forward_step hook after
+    a successful W4A4 QAT install (fail-fast otherwise).
     """
     qat_config = QATConfig.from_env()
     if not qat_config.enable:
         logger.info("[vexact-qat] VEXACT_QAT_ENABLE not set; training-side QAT disabled.")
+        # CPA without QAT is a hard error (do not silently train without alignment).
+        maybe_enable_cpa_after_qat(qat_installed=False, qat_config=qat_config)
         return False
 
     logger.info(f"[vexact-qat] Training-side QAT enabled: {qat_config}")
@@ -368,8 +437,10 @@ def enable_training_qat() -> bool:
             "[vexact-qat] Training-side QAT enabled but no VeOmni hooks were patched "
             "(build_foundation_model / load_model_weights / rank0_load_and_broadcast_weights)."
         )
+        maybe_enable_cpa_after_qat(qat_installed=False, qat_config=qat_config)
         return False
     logger.info(f"[vexact-qat] Training-side QAT hook installed ({patched} namespace(s)).")
+    maybe_enable_cpa_after_qat(qat_installed=True, qat_config=qat_config)
     return True
 
 

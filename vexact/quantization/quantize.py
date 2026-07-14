@@ -192,11 +192,48 @@ def _needs_calibration(mtq_cfg: dict[str, Any]) -> bool:
         return False
 
 
+def _force_eager_attention(model: nn.Module) -> Optional[dict[str, Any]]:
+    """Temporarily switch HF attention to eager so smoke calib needs no KV cache.
+
+    VeXact rollout registers paged flash/flex attention backends that require
+    ``set_kv_cache_context()``. Random-token QAT calibration runs before the
+    inferencer installs that context, so we force ``eager`` for the duration of
+    the smoke forward. Real amax for w4a4 rollout still comes from actor refit.
+    """
+    config = getattr(model, "config", None)
+    if config is None:
+        return None
+    prev = {
+        "_attn_implementation": getattr(config, "_attn_implementation", None),
+    }
+    try:
+        config._attn_implementation = "eager"
+    except Exception:  # pragma: no cover
+        return None
+    return prev
+
+
+def _restore_attention(model: nn.Module, prev: Optional[dict[str, Any]]) -> None:
+    if not prev:
+        return
+    config = getattr(model, "config", None)
+    if config is None:
+        return
+    impl = prev.get("_attn_implementation")
+    if impl is not None:
+        try:
+            config._attn_implementation = impl
+        except Exception:  # pragma: no cover
+            pass
+
+
 def _random_calibration_forward_loop(qat_config: QATConfig) -> ForwardLoop:
     """A minimal random-token calibration loop (matches NeMo-RL's 'random' path).
 
-    This only populates quantizer statistics so mtq does not warn about unset
-    amax. Prefer supplying a real forward loop over relying on this.
+    Forces eager attention during the forward so VeXact paged-attn backends
+    (which need KV cache context) are not invoked. This only materializes
+    quantizer ``amax`` buffers; prefer a real forward loop for production
+    training-side calibration. Rollout w4a4 still overwrites IQ amax from actor.
     """
 
     def forward_loop(model: nn.Module) -> None:
@@ -206,8 +243,12 @@ def _random_calibration_forward_loop(qat_config: QATConfig) -> ForwardLoop:
             device = torch.device("cpu")
         seq_len = max(1, min(qat_config.calib_seq_len, 8))
         input_ids = torch.randint(0, 100, (1, seq_len), device=device)
-        with torch.no_grad():
-            model(input_ids=input_ids)
+        prev_attn = _force_eager_attention(model)
+        try:
+            with torch.no_grad():
+                model(input_ids=input_ids)
+        finally:
+            _restore_attention(model, prev_attn)
 
     return forward_loop
 
@@ -223,21 +264,19 @@ def quantize_model(
         model: the (pre-FSDP-wrap / pre-eval) model to quantize.
         qat_config: resolved QAT settings shared across train/infer sides.
         forward_loop: optional calibration callable ``fn(model) -> None``. When
-            ``qat_config.calibrate`` is True and this is None, a lightweight
-            random-token calibration loop is used as a fallback.
+            ``qat_config.effective_calibrate`` is True and this is None, a
+            lightweight random-token calibration loop is used as a fallback.
 
     Returns:
         The same model object, now quantized. Idempotent: if the model is
         already quantized this is a no-op.
 
     Notes:
-        For NVFP4 (``w4a4``/``w4a16``) with ``calibrate=False`` we intentionally
-        pass ``forward_loop=None`` so calibration is skipped and no static
-        ``_amax`` buffer is created. modelopt then computes the (enabled)
-        quantizer amax dynamically per forward, which keeps the training and
-        rollout numerics consistent without any amax synchronization. For
-        ``w4a16`` the activation (``input_quantizer``) side is simply disabled
-        via :func:`resolve_quant_cfg`, so only the weight quantizer runs.
+        ``w4a4`` always calibrates so ``input_quantizer.amax`` is materialized
+        for train/rollout sync. ``w4a16`` typically skips calibration
+        (``calibrate=False``); only the weight quantizer runs (activations
+        disabled via :func:`resolve_quant_cfg`), and 0 mismatch comes from
+        training-side weight fold.
     """
     if not qat_config.enable:
         return model
@@ -250,29 +289,29 @@ def quantize_model(
 
     mtq_cfg = resolve_quant_cfg(qat_config)
     cfg_name = qat_config.resolved_cfg_name()
+    do_calibrate = qat_config.effective_calibrate
 
-    if qat_config.mode == "w4a16" and qat_config.calibrate:
-        logger.warning(
-            "[vexact-qat] calibrate=True with mode=w4a16 can materialize static "
-            "quantizer state that is not synchronized to rollout. Prefer "
-            "calibrate=False for weight-only NVFP4 QAT."
+    if qat_config.mode == "w4a4" and not do_calibrate:
+        raise ValueError(
+            "quantize_model: mode='w4a4' requires calibration "
+            "(QATConfig.calibrate=True) for train/rollout 0 mismatch."
         )
 
-    if qat_config.calibrate:
+    if do_calibrate:
         if forward_loop is None:
             logger.warning(
                 "[vexact-qat] calibrate=True but no forward_loop provided; using a "
-                "random-token calibration fallback. Static amax from mismatched "
-                "calibration data can break train/infer alignment."
+                "random-token calibration fallback. Prefer a real calib dataset "
+                "for production w4a4 runs."
             )
             forward_loop = _random_calibration_forward_loop(qat_config)
     else:
         if _needs_calibration(mtq_cfg):
             logger.info(
-                "[vexact-qat] Skipping calibration for '%s' (calibrate=False): "
-                "activation amax will be computed dynamically per forward, keeping "
-                "train/infer aligned without amax sync.",
+                "[vexact-qat] Skipping calibration for '%s' (mode=%s, "
+                "calibrate=False): weight-only path; amax sync not required.",
                 cfg_name,
+                qat_config.mode,
             )
         forward_loop = None
 
@@ -281,7 +320,7 @@ def quantize_model(
         qat_config.mode,
         cfg_name,
         qat_config.ignore_patterns,
-        qat_config.calibrate,
+        do_calibrate,
     )
 
     model = mtq.quantize(model, mtq_cfg, forward_loop)

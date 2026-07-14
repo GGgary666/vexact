@@ -15,6 +15,7 @@
 
 import logging
 import os
+import time
 from typing import Generator
 
 import ray
@@ -28,6 +29,39 @@ from verl.workers.rollout.base import BaseRollout
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+
+def _is_global_rank0() -> bool:
+    return int(os.environ.get("RANK", "0")) == 0
+
+
+def _qat_mode_label(*, has_iq_map: bool) -> str:
+    mode = os.environ.get("VEXACT_QAT_MODE", "").strip()
+    if mode:
+        return mode
+    return "w4a4" if has_iq_map else "w4a16"
+
+
+def _resolve_qat_step(kwargs: dict, adapter: "ServerAdapter") -> int:
+    step = kwargs.get("global_steps", kwargs.get("step"))
+    if step is not None:
+        return int(step)
+    # verl's update_weights path does not currently pass global_steps; fall back
+    # to a per-adapter QAT sync ordinal so logs stay monotonically readable.
+    adapter._qat_sync_step = getattr(adapter, "_qat_sync_step", 0) + 1
+    return int(adapter._qat_sync_step)
+
+
+def _amax_applied_from_receive_result(result) -> int:
+    """Best-effort extract applied amax count from receive_weights return value."""
+    if result is None:
+        return 0
+    if isinstance(result, int):
+        return result
+    if isinstance(result, (list, tuple)):
+        counts = [x for x in result if isinstance(x, int)]
+        return max(counts) if counts else 0
+    return 0
 
 
 class ServerAdapter(BaseRollout):
@@ -93,23 +127,51 @@ class ServerAdapter(BaseRollout):
     async def update_weights(
         self,
         weights: Generator[tuple[str, torch.Tensor], None, None],
-        **kwargs,  # noqa: ARG002
+        **kwargs,
     ):
         """Update model weights via bucketed IPC transfer to inference workers.
 
         When QAT is enabled and the training-side weight_quantizer_map is cached,
         weights are folded via the actor's weight_quantizer before being sent to
-        rollout (NeMo-RL QARL-style). This avoids per-bucket fold overhead on the
-        rollout side and ensures train/rollout distribution consistency.
+        rollout (NeMo-RL QARL-style). For w4a4, enabled ``input_quantizer.amax``
+        buffers are appended so rollout activation fake-quant matches training.
         """
+        from vexact.quantization.amax_sync import (
+            chain_weights_with_input_amax,
+            get_training_input_quantizer_map,
+        )
         from vexact.quantization.fold import (
             fold_weights_generator,
             get_training_weight_quantizer_map,
         )
 
         wq_map = get_training_weight_quantizer_map()
+        iq_map = get_training_input_quantizer_map()
+        qat_active = bool(wq_map) or bool(iq_map)
+        log_qat = qat_active and _is_global_rank0()
+        # Always collect stats when QAT is active so legacy per-rank INFO logs are
+        # suppressed; only RANK 0 emits the step-level summary below.
+        fold_stats: dict[str, int] = {}
+        amax_stats: dict[str, int] = {}
+        step = 0
+        mode = ""
+        t0 = 0.0
+
+        if log_qat:
+            step = _resolve_qat_step(kwargs, self)
+            mode = _qat_mode_label(has_iq_map=bool(iq_map))
+            t0 = time.perf_counter()
+            logger.info("[vexact-qat] step=%s update_weights begin (mode=%s)", step, mode)
+
         if wq_map:
-            weights = fold_weights_generator(weights, wq_map)
+            weights = fold_weights_generator(
+                weights, wq_map, stats=fold_stats if qat_active else None
+            )
+
+        if iq_map:
+            weights = chain_weights_with_input_amax(
+                weights, iq_map, stats=amax_stats if qat_active else None
+            )
 
         future = None
         if self.rollout_rank == 0:
@@ -124,11 +186,40 @@ class ServerAdapter(BaseRollout):
         )
         sender.send_weights(weights)
 
+        receive_result = None
         if future is not None:
-            await future
+            receive_result = await future
 
         if self.rollout_rank == 0:
             await self.server_handle.clear_kv_cache.remote()
+
+        if log_qat:
+            if fold_stats:
+                logger.info(
+                    "[vexact-qat] step=%s weight fold done: folded=%d/%d, cast_fp32_to_bf16=%d",
+                    step,
+                    fold_stats.get("folded", 0),
+                    fold_stats.get("total", 0),
+                    fold_stats.get("cast_fp32_to_bf16", 0),
+                )
+            if iq_map:
+                attached = amax_stats.get("attached", 0)
+                applied = _amax_applied_from_receive_result(receive_result)
+                # If this rank did not own the receive future, fall back to attached.
+                if applied == 0 and attached > 0 and receive_result is None:
+                    applied = attached
+                logger.info(
+                    "[vexact-qat] step=%s amax sync done: attached=%d, applied=%d (max-merge)",
+                    step,
+                    attached,
+                    applied,
+                )
+            elapsed = time.perf_counter() - t0
+            logger.info(
+                "[vexact-qat] step=%s update_weights end (elapsed=%.2fs)",
+                step,
+                elapsed,
+            )
 
     def generate_sequences(self, prompts):
         """Sync generation no longer supported."""

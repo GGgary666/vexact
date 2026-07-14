@@ -151,21 +151,28 @@ class VeXactServer:
         if qat_config is not None:
             logger.info(f"[vexact] Rollout QAT enabled: {qat_config}")
 
+        # Honor rollout.enforce_eager as-is (NeMo-RL QARL style): w4a16 is plain
+        # BF16 Linear after fold; w4a4 keeps input_quantizer but disables WQ so
+        # CudaGraphManager capture can succeed, same as vLLM FakeQuantWorker.
         rollout_enforce_eager = self.config.enforce_eager
-        if qat_config is not None and qat_config.enable and not rollout_enforce_eager:
-            # w4a16: plain BF16 Linear after training-side fold → CUDA graph OK.
-            # w4a4: keeps input_quantizer modules → force eager.
-            if qat_config.mode == "w4a16":
+        if qat_config is not None and qat_config.enable:
+            if rollout_enforce_eager:
                 logger.info(
-                    "[vexact] QAT rollout: keeping CUDA graph enabled (w4a16; "
+                    "[vexact] QAT rollout: enforce_eager=True (CUDA graph disabled); "
+                    "mode=%s.",
+                    qat_config.mode,
+                )
+            elif qat_config.mode == "w4a16":
+                logger.info(
+                    "[vexact] QAT rollout: CUDA graph enabled (w4a16; "
                     "rollout model stays as pure BF16 nn.Linear with folded weights)."
                 )
             else:
-                logger.warning(
-                    "[vexact] QAT rollout: forcing enforce_eager=True because CUDA graph "
-                    "capture/replay is unreliable with modelopt input_quantizer modules."
+                logger.info(
+                    "[vexact] QAT rollout: CUDA graph enabled (mode=%s; "
+                    "weight_quantizer disabled, input_quantizer kept — NeMo-RL style).",
+                    qat_config.mode,
                 )
-                rollout_enforce_eager = True
 
         vexact_config = VeXactConfig(
             model=ModelConfig(

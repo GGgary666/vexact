@@ -16,8 +16,6 @@ import abc
 import argparse
 import logging
 import threading
-from typing import Iterable
-
 import torch
 
 from vexact.config import ModelConfig, ParallelConfig, PPInfo, ProfilerConfig, VeXactConfig
@@ -162,20 +160,49 @@ class Worker(WorkerBase):
         """Restore GPU memory from CPU."""
         TorchMemorySaverAdapter.get_instance().resume(tag=tag)
 
-    def load_state_dict(self, state_dict: dict[str, torch.Tensor]):
-        """Update model weights via direct parameter copy."""
+    def load_state_dict(self, state_dict: dict[str, torch.Tensor]) -> int:
+        """Update model weights via direct parameter copy.
+
+        Also applies ``input_quantizer`` amax buffers when present (w4a4 refit),
+        using max-merge for TP-safe sync.
+
+        Returns:
+            Number of input amax buffers applied in this call.
+        """
+        from vexact.quantization.amax_sync import (
+            apply_input_amax_buffers,
+            split_weights_and_input_amax,
+        )
+
         if not hasattr(self, "_named_parameters"):  # Cache Index
             self._named_parameters = dict(self.model.named_parameters())
-        # convert state_dict into iterable
-        weight_iterator: Iterable[tuple[str, torch.Tensor]] = state_dict.items()
-        load_weights_from_weight_iterator(self.model, self.config.model.hf_config, weight_iterator)
+        weights, amaxes = split_weights_and_input_amax(state_dict.items())
+        if weights:
+            load_weights_from_weight_iterator(
+                self.model, self.config.model.hf_config, iter(weights)
+            )
+        applied = 0
+        if amaxes:
+            applied = apply_input_amax_buffers(self.model, amaxes)
+        return applied
 
-    def receive_weights(self):
-        """Receive model weights via IPC transfer from another proc on the SAME device."""
+    def receive_weights(self) -> int:
+        """Receive model weights via IPC transfer from another proc on the SAME device.
+
+        Returns:
+            Total number of input amax buffers applied across all buckets.
+        """
         from vexact.integrations.verl.bucketed_weight_transfer import BucketedWeightReceiver
 
+        applied_total = 0
+
+        def _on_bucket(weights):
+            nonlocal applied_total
+            applied_total += self.load_state_dict(dict(weights))
+
         receiver = BucketedWeightReceiver(zmq_handle=self.zmq_handle, device=self.device)
-        receiver.receive_weights(on_bucket_received=lambda weights: self.load_state_dict(dict(weights)))
+        receiver.receive_weights(on_bucket_received=_on_bucket)
+        return applied_total
 
 
 def run_worker(config: VeXactConfig, rank: int):

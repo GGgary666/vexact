@@ -401,6 +401,7 @@ class ModelCreator:
             return
 
         from vexact.quantization import quantize_model
+        from vexact.quantization.amax_sync import fill_input_amax_sentinel
         from vexact.quantization.fold import (
             audit_rollout_quant_state,
             disable_weight_quantizers,
@@ -409,18 +410,23 @@ class ModelCreator:
         logger.info(
             "[VEXACT] Applying QAT to rollout model for activation quant only "
             f"(mode={qat_config.mode}, cfg={qat_config.resolved_cfg_name()}). "
-            "Weight quantizers will be disabled; folded weights come from training."
+            "Weight quantizers will be disabled; folded weights and input amax "
+            "come from training. Local calib only materializes amax buffers "
+            "(eager attn smoke forward), then sentinel-filled until actor refit."
         )
         quantize_model(self._causal_model, qat_config)
         disabled = disable_weight_quantizers(self._causal_model)
+        # NeMo-RL style: local calib amax is only a placeholder; actor refit wins.
+        sentinel_filled = fill_input_amax_sentinel(self._causal_model, value=-1.0)
         stats = audit_rollout_quant_state(
             self._causal_model, context="after disable weight_quantizer (w4a4 fold path)"
         )
         logger.info(
             "[VEXACT-QAT] Rollout w4a4 fold path: disabled %d weight_quantizer(s); "
-            "input_quantizer_enabled=%d.",
+            "input_quantizer_enabled=%d; sentinel_amax_filled=%d.",
             disabled,
             stats["input_quantizer_enabled"],
+            sentinel_filled,
         )
         if stats["weight_quantizer_enabled"] > 0:
             raise RuntimeError(
