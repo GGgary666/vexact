@@ -15,6 +15,14 @@ examples/
 └── math_reward_model/    # reward functions used by the recipes above
 ```
 
+Local / cluster experiment launchers (including QAOPD) live under ``exp_scripts/``
+(gitignored). QAOPD GSM8K recipe: ``exp_scripts/qaopd/run_qwen3_1b7_gsm8k.sh``.
+
+QAOPD default layout (8 GPUs): student VeXact W4A4 on GPUs 0–3; **teacher VeXact BF16**
+(no QAT) on GPUs 4–7 as **4×1-GPU replicas** (not TP=4). External modules load order:
+
+``register,qaopd,teacher_vexact``.
+
 ## Recipe index
 
 | Recipe                               | Model                         | Dataset (train / val)                                                                          | Hardware | Algorithm     | Notes                                       |
@@ -30,6 +38,7 @@ examples/
 | `verify/run_dense_vllm.sh`           | DeepSeek-R1-Distill-Qwen-1.5B | MATH ([math_1460](https://huggingface.co/datasets/sail/Sanity-Test-R1D-1.5B)) / AIME 2024+2025 | 1× 8H100 | GRPO (vllm)   | Baseline for determinism check              |
 
 ## Running a recipe
+
 
 All vexact scripts assume they are launched **from the repo root** (`vexact/`)
 
