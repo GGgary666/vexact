@@ -60,6 +60,13 @@ class InferenceRequest:
     generated_logits: list[torch.Tensor] = field(default_factory=list)  # Store logits for each token
     generated_logprobs: list[float] = field(default_factory=list)
 
+    # Score-only (teacher prompt_logprobs) path
+    score_only: bool = False
+    prompt_logprobs_k: int = 0
+    scored_topk_ids: list[list[int]] = field(default_factory=list)
+    scored_topk_logprobs: list[list[float]] = field(default_factory=list)
+    fail_reason: str | None = None
+
     # Tracks original prompt length for correct token folding on repeated preemptions
     _original_prompt_len: int = 0
 
@@ -86,6 +93,8 @@ class InferenceRequest:
             request_id=driver_request.request_id,
             generation_config=driver_request.generation_config,
             input_ids_list=driver_request.input_ids_list,
+            score_only=bool(getattr(driver_request, "score_only", False)),
+            prompt_logprobs_k=int(getattr(driver_request, "prompt_logprobs_k", 0) or 0),
         )
 
     @property
@@ -98,8 +107,10 @@ class InferenceRequest:
         self.status = RequestStatus.RUNNING
         self.start_generation_time = time.time()
 
-    def fail(self):
+    def fail(self, reason: str | None = None):
         self.status = RequestStatus.FAILED
+        if reason is not None:
+            self.fail_reason = reason
 
     def should_finish(self, token_id: int) -> bool:
         """Check if this request should finish given the latest token.
@@ -131,6 +142,7 @@ class InferenceRequest:
 
         Folds newly generated tokens into input_ids_list so the next prefill replays the
         full sequence, while preserving generated_tokens/logprobs for output tracking.
+        Score-only accumulators are cleared so re-prefill does not duplicate top-k rows.
         """
         already_folded = len(self.input_ids_list) - self._original_prompt_len
         new_tokens = self.generated_tokens[already_folded:]
@@ -138,6 +150,8 @@ class InferenceRequest:
         self.block_ids = []
         self.num_computed_tokens = 0
         self.tokens_this_step = 0
+        self.scored_topk_ids = []
+        self.scored_topk_logprobs = []
         self.status = RequestStatus.PENDING
 
     def finish(self):
@@ -149,12 +163,19 @@ class InferenceRequest:
 
     def to_driver_request_output(self) -> "DriverRequestOutput":
         """Convert to DriverRequestOutput for IPC."""
+        prompt_ids = None
+        prompt_logprobs = None
+        if self.score_only and self.scored_topk_ids:
+            prompt_ids = self.scored_topk_ids
+            prompt_logprobs = self.scored_topk_logprobs
         return DriverRequestOutput(
             request_id=self.request_id,
             new_token_ids=self.generated_tokens,
             new_logprobs=self.generated_logprobs if self.generated_logprobs else None,
             status=self.status,
-            # TODO: reason
+            reason=self.fail_reason,
+            prompt_ids=prompt_ids,
+            prompt_logprobs=prompt_logprobs,
         )
 
 
@@ -171,6 +192,8 @@ class DriverRequest(
     generation_config: GenerationConfig
     input_ids_list: list[int]
     request_id: str = msgspec.field(default_factory=_generate_request_id)
+    score_only: bool = False
+    prompt_logprobs_k: int = 0
 
     @staticmethod
     def enc_hook(obj: Any) -> Any:
@@ -196,12 +219,18 @@ class DriverRequestOutput(
     new_logprobs: list[float] | None = None
     status: RequestStatus = RequestStatus.RUNNING
     reason: str | None = None
+    prompt_ids: list[list[int]] | None = None
+    prompt_logprobs: list[list[float]] | None = None
 
     @property
     def is_finished(self) -> bool:
         """Check if request is finished (completed or failed)."""
-        return self.status == RequestStatus.FINISHED
+        return self.status in (RequestStatus.FINISHED, RequestStatus.FAILED)
 
     @property
     def is_running(self) -> bool:
         return self.status == RequestStatus.RUNNING
+
+    @property
+    def is_failed(self) -> bool:
+        return self.status == RequestStatus.FAILED

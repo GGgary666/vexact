@@ -41,6 +41,7 @@ from vexact.core.request import InferenceRequest
 from vexact.core.runtime_data import GenerationContext, InferencerOutput, InputBuffers
 from vexact.distributed.pp_messager import PPMessager
 from vexact.inferencer.cudagraph_utils import BatchExecutionDescriptor, CudaGraphManager
+from vexact.inferencer.prompt_logprobs import score_only_topk_from_packed_logits
 from vexact.inferencer.sampler import Sampler
 from vexact.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -157,10 +158,16 @@ class Inferencer:
             outputs = self._forward(gen_ctx)
 
         if self._pp_info.is_last_rank and gen_ctx is not None:
-            token_ids, logits, logprobs = self._select_tokens(
-                gen_ctx.generation_configs, gen_ctx.tokens_generated, outputs, gen_ctx
+            token_ids, logits, logprobs, topk_ids, topk_logprobs = self._select_tokens(
+                gen_ctx.generation_configs, gen_ctx.tokens_generated, outputs, gen_ctx, requests
             )
-            final_output = InferencerOutput(token_ids=token_ids, logits=logits, logprobs=logprobs)
+            final_output = InferencerOutput(
+                token_ids=token_ids,
+                logits=logits,
+                logprobs=logprobs,
+                topk_token_ids=topk_ids,
+                topk_logprobs=topk_logprobs,
+            )
             if self._pp_info.is_first_rank:
                 return final_output
             else:
@@ -396,7 +403,35 @@ class Inferencer:
         tokens_generated: Sequence[int],
         outputs: ModelOutput,
         gen_ctx: GenerationContext,
-    ) -> tuple[Tensor, list[Tensor], list[Tensor]]:
+        requests: Sequence[InferenceRequest] | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor, Optional[Tensor], Optional[Tensor]]:
+        score_requests = [req for req in (requests or []) if req.score_only]
+        if score_requests:
+            if requests is None or len(score_requests) != len(requests):
+                raise RuntimeError(
+                    "Score-only and generation requests cannot be mixed in the same infer batch "
+                    f"(score_only={len(score_requests)}, total={len(requests or [])})"
+                )
+            ks = {int(req.prompt_logprobs_k) for req in score_requests}
+            if len(ks) != 1:
+                raise RuntimeError(f"All score-only requests in a batch must share the same k, got {ks}")
+            k = next(iter(ks))
+            if k <= 0:
+                raise RuntimeError(f"score-only prompt_logprobs_k must be > 0, got {k}")
+
+            # Packed prefill logits may be CUDA-graph padded to capture size;
+            # slice to the real packed token count before top-k (scheduler
+            # consumes sum(tokens_this_step) rows).
+            num_tokens = int(gen_ctx.batch_position_ids.shape[1])
+            topk_ids, topk_logprobs = score_only_topk_from_packed_logits(
+                outputs.logits, num_tokens=num_tokens, k=k
+            )
+            # Dummy per-request token slots so scheduler zip_longest stays aligned.
+            num_seqs = len(score_requests)
+            token_ids = torch.zeros(num_seqs, dtype=torch.long, device=self.device)
+            empty = torch.empty(0, device=self.device)
+            return token_ids, empty, empty, topk_ids, topk_logprobs
+
         # Collect indices for all requests and slice logits once to avoid per-token LM head work
         # The selected token is always the last token in each request slice. For decode
         # requests the slice length is 1, so this is also the first token.
@@ -446,4 +481,4 @@ class Inferencer:
             logprobs = torch.empty(0, device=self.device)
 
         token_ids = batch_tokens.to(self.device)
-        return token_ids, logits, logprobs
+        return token_ids, logits, logprobs, None, None

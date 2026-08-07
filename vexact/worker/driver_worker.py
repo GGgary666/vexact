@@ -84,6 +84,17 @@ class DriverWorker(Worker):
                 import traceback
 
                 logger.error(traceback.format_exc())
+                # Propagate failure to callers waiting on the request channel.
+                try:
+                    active = list(self.scheduler._active_requests.values())
+                    for req in active:
+                        req.fail(reason=f"{type(e).__name__}: {e}")
+                    if active:
+                        for req in active:
+                            self.scheduler._active_requests.pop(req.request_id, None)
+                        self.scheduler._result_queue.put(active)
+                except Exception as fail_exc:  # pragma: no cover
+                    logger.error(f"Failed to mark active requests FAILED: {fail_exc}")
                 time.sleep(0.1)
                 # breakpoint()
                 break

@@ -135,3 +135,6 @@ class InferencerOutput:
     token_ids: Tensor
     logits: Tensor
     logprobs: Tensor
+    # Packed score-only top-k over all tokens in the infer batch (empty for generation).
+    topk_token_ids: Optional[Tensor] = None
+    topk_logprobs: Optional[Tensor] = None

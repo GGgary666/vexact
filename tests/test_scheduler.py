@@ -714,3 +714,122 @@ def test_repeated_preemption_no_token_duplication_in_input_ids():
     assert req.generated_tokens == [40, 50, 60, 70, 80]
     assert len(req.generated_tokens) == 5
     assert req.num_computed_tokens == 0
+
+
+def test_scheduler_score_only_non_chunked_finalize(kv_cache_manager):
+    scheduler = Scheduler(
+        config=SchedulerConfig(max_num_batched_tokens=16, max_queue_size=4, enable_chunked_prefill=False),
+        kv_cache_manager=kv_cache_manager(page_size=32, max_blocks=8),
+        pp_info=PPInfo(1, 0),
+    )
+    gen_config = GenerationConfig(max_new_tokens=1, max_length=8)
+    req = InferenceRequest(
+        request_id="score-0",
+        generation_config=gen_config,
+        input_ids_list=[1, 2, 3, 4],
+        score_only=True,
+        prompt_logprobs_k=2,
+    )
+    assert scheduler.submit_request(req)
+    out = scheduler.schedule()
+    assert len(out.batch_to_infer) == 1
+    assert req.tokens_this_step == 4
+    assert req.num_computed_tokens == 4
+
+    packed_ids = torch.tensor([[10, 11], [20, 21], [30, 31], [40, 41]], dtype=torch.int64)
+    packed_lp = torch.tensor(
+        [[-0.1, -0.2], [-0.3, -0.4], [-0.5, -0.6], [-0.7, -0.8]], dtype=torch.float32
+    )
+    infer_result = InferencerOutput(
+        token_ids=torch.zeros(1, dtype=torch.long),
+        logits=torch.empty(0),
+        logprobs=torch.empty(0),
+        topk_token_ids=packed_ids,
+        topk_logprobs=packed_lp,
+    )
+    scheduler.update(out.batch_to_infer, infer_result)
+    finished = scheduler.poll_results(timeout=0.1)
+    assert len(finished) == 1
+    assert finished[0].status == RequestStatus.FINISHED
+    assert finished[0].generated_tokens == []
+    assert finished[0].scored_topk_ids == [[10, 11], [20, 21], [30, 31], [0, 0]]
+    assert finished[0].scored_topk_logprobs[-1] == [0.0, 0.0]
+
+
+def test_scheduler_score_only_chunked_matches_non_chunked(kv_cache_manager):
+    gen_config = GenerationConfig(max_new_tokens=1, max_length=8)
+    input_ids = [1, 2, 3, 4]
+    packed_ids = torch.tensor([[10, 11], [20, 21], [30, 31], [40, 41]], dtype=torch.int64)
+    packed_lp = torch.tensor(
+        [[-0.1, -0.2], [-0.3, -0.4], [-0.5, -0.6], [-0.7, -0.8]], dtype=torch.float32
+    )
+
+    def run(chunked: bool):
+        scheduler = Scheduler(
+            config=SchedulerConfig(
+                max_num_batched_tokens=2 if chunked else 16,
+                max_queue_size=4,
+                enable_chunked_prefill=chunked,
+            ),
+            kv_cache_manager=kv_cache_manager(page_size=32, max_blocks=8),
+            pp_info=PPInfo(1, 0),
+        )
+        req = InferenceRequest(
+            request_id="score-chunk",
+            generation_config=gen_config,
+            input_ids_list=list(input_ids),
+            score_only=True,
+            prompt_logprobs_k=2,
+        )
+        scheduler.submit_request(req)
+        offset = 0
+        while True:
+            sched_out = scheduler.schedule()
+            if not sched_out.batch_to_infer:
+                break
+            n = int(req.tokens_this_step)
+            infer_result = InferencerOutput(
+                token_ids=torch.zeros(1, dtype=torch.long),
+                logits=torch.empty(0),
+                logprobs=torch.empty(0),
+                topk_token_ids=packed_ids[offset : offset + n],
+                topk_logprobs=packed_lp[offset : offset + n],
+            )
+            offset += n
+            scheduler.update(sched_out.batch_to_infer, infer_result)
+            finished = scheduler.poll_results(timeout=0.0)
+            if finished:
+                return finished[0].scored_topk_ids, finished[0].scored_topk_logprobs
+        raise AssertionError("score-only request never finished")
+
+    assert run(False) == run(True)
+
+
+def test_scheduler_score_only_preempt_clears_partial_rows(kv_cache_manager):
+    scheduler = Scheduler(
+        config=SchedulerConfig(max_num_batched_tokens=2, max_queue_size=4, enable_chunked_prefill=True),
+        kv_cache_manager=kv_cache_manager(page_size=32, max_blocks=8),
+        pp_info=PPInfo(1, 0),
+    )
+    req = InferenceRequest(
+        request_id="score-preempt",
+        generation_config=GenerationConfig(max_new_tokens=1, max_length=8),
+        input_ids_list=[1, 2, 3, 4],
+        score_only=True,
+        prompt_logprobs_k=2,
+    )
+    scheduler.submit_request(req)
+    sched_out = scheduler.schedule()
+    n = int(req.tokens_this_step)
+    infer_result = InferencerOutput(
+        token_ids=torch.zeros(1, dtype=torch.long),
+        logits=torch.empty(0),
+        logprobs=torch.empty(0),
+        topk_token_ids=torch.arange(n * 2).reshape(n, 2),
+        topk_logprobs=torch.zeros(n, 2),
+    )
+    scheduler.update(sched_out.batch_to_infer, infer_result)
+    assert len(req.scored_topk_ids) == n
+    scheduler._preempt_request(req)
+    assert req.scored_topk_ids == []
+    assert req.scored_topk_logprobs == []

@@ -22,6 +22,7 @@ from vexact.batch_invariant_ops.kv_cache_context import KVCacheManager
 from vexact.config import PPInfo, SchedulerConfig
 from vexact.core.request import InferenceRequest
 from vexact.core.runtime_data import InferencerOutput
+from vexact.inferencer.prompt_logprobs import finalize_scored_prompt_logprobs
 
 
 logger = logging.getLogger(__name__)
@@ -212,6 +213,14 @@ class Scheduler:
         """Process inference outputs and finalize completed requests."""
         finished_requests = []
 
+        if any(req.score_only for req in requests):
+            if not all(req.score_only for req in requests):
+                raise RuntimeError("Cannot mix score-only and generation requests in scheduler.update")
+            self._update_score_only(requests, infer_result, finished_requests)
+            if finished_requests:
+                self._result_queue.put(finished_requests)
+            return
+
         # Process outputs for each request
         # zip_longest is when output_logits or output_scores is off
         for request, token_tensor, logits, logprobs in zip_longest(
@@ -233,6 +242,54 @@ class Scheduler:
             # currently we only put the finished request state in to the queue
             # cuz we don't need to do streaming the partial states for now
             self._result_queue.put(finished_requests)
+
+    def _update_score_only(
+        self,
+        requests: list[InferenceRequest],
+        infer_result: InferencerOutput,
+        finished_requests: list[InferenceRequest],
+    ) -> None:
+        """Accumulate packed top-k rows and finalize after full prompt prefill."""
+        if infer_result.topk_token_ids is None or infer_result.topk_logprobs is None:
+            raise RuntimeError("score-only update requires InferencerOutput.topk_token_ids/logprobs")
+
+        topk_ids = infer_result.topk_token_ids.detach().cpu()
+        topk_logprobs = infer_result.topk_logprobs.detach().cpu()
+        offset = 0
+        for request in requests:
+            n = int(request.tokens_this_step or 0)
+            if n <= 0:
+                continue
+            chunk_ids = topk_ids[offset : offset + n]
+            chunk_lp = topk_logprobs[offset : offset + n]
+            if chunk_ids.shape[0] != n:
+                raise RuntimeError(
+                    f"score-only packed top-k length mismatch for {request.request_id}: "
+                    f"expected {n} rows starting at {offset}, got {chunk_ids.shape[0]}"
+                )
+            for row_ids, row_lp in zip(chunk_ids.tolist(), chunk_lp.tolist()):
+                request.scored_topk_ids.append([int(x) for x in row_ids])
+                request.scored_topk_logprobs.append([float(x) for x in row_lp])
+            offset += n
+
+            if request.num_computed_tokens < len(request.input_ids_list):
+                continue
+
+            # Full prompt prefilled: drop logits for the last prompt token (VeRL dummy instead).
+            seq_len = len(request.input_ids_list)
+            request.scored_topk_ids, request.scored_topk_logprobs = finalize_scored_prompt_logprobs(
+                request.scored_topk_ids,
+                request.scored_topk_logprobs,
+                seq_len=seq_len,
+                k=request.prompt_logprobs_k,
+            )
+            self._finalize_request(request)
+            finished_requests.append(request)
+
+        if offset != topk_ids.shape[0]:
+            raise RuntimeError(
+                f"score-only packed top-k unused rows: consumed={offset}, total={topk_ids.shape[0]}"
+            )
 
     def _activate_request(self, request: InferenceRequest) -> None:
         """Activate a request for processing: allocate resources incrementally.

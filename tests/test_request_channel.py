@@ -115,6 +115,53 @@ def test_driver_request_preserves_generation_config_seed():
     assert decoded.input_ids_list == request.input_ids_list
     assert decoded.generation_config.max_new_tokens == 10
     assert decoded.generation_config.seed == 12345
+    assert decoded.score_only is False
+    assert decoded.prompt_logprobs_k == 0
+
+
+def test_driver_request_score_only_roundtrip():
+    request = DriverRequest(
+        request_id="score_req",
+        generation_config=GenerationConfig(max_new_tokens=1),
+        input_ids_list=[10, 20, 30],
+        score_only=True,
+        prompt_logprobs_k=64,
+    )
+    encoder = msgspec.msgpack.Encoder(enc_hook=DriverRequest.enc_hook)
+    decoder = msgspec.msgpack.Decoder(DriverRequest, dec_hook=DriverRequest.dec_hook)
+    decoded = decoder.decode(encoder.encode(request))
+    assert decoded.score_only is True
+    assert decoded.prompt_logprobs_k == 64
+
+    from vexact.core.request import InferenceRequest
+
+    infer = InferenceRequest.from_driver_request(decoded)
+    assert infer.score_only is True
+    assert infer.prompt_logprobs_k == 64
+    infer.scored_topk_ids = [[1, 2], [3, 4], [0, 0]]
+    infer.scored_topk_logprobs = [[-0.1, -0.2], [-0.3, -0.4], [0.0, 0.0]]
+    infer.status = RequestStatus.FINISHED
+    out = infer.to_driver_request_output()
+    assert out.prompt_ids == infer.scored_topk_ids
+    assert out.prompt_logprobs == infer.scored_topk_logprobs
+    assert out.new_token_ids == []
+
+    out_encoder = msgspec.msgpack.Encoder()
+    out_decoder = msgspec.msgpack.Decoder(DriverRequestOutput)
+    decoded_out = out_decoder.decode(out_encoder.encode(out))
+    assert decoded_out.prompt_ids == [[1, 2], [3, 4], [0, 0]]
+    assert decoded_out.is_finished is True
+
+
+def test_failed_output_is_finished():
+    out = DriverRequestOutput(
+        request_id="x",
+        new_token_ids=[],
+        status=RequestStatus.FAILED,
+        reason="boom",
+    )
+    assert out.is_failed is True
+    assert out.is_finished is True
 
 
 class TestRequestChannel:
