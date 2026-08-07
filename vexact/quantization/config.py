@@ -125,6 +125,23 @@ class QATConfig:
     # forward loop is not otherwise supplied.
     calib_size: int = 512
     calib_seq_len: int = 512
+    # Calibration data source for training-side amax materialization:
+    #   - ``None``: for w4a4 production, fail-fast unless ``allow_random_calib``
+    #   - ``"random"``: lightweight random-token fallback (tests / explicit opt-in)
+    #   - path to a ``.jsonl`` file (one JSON object per line with a text field)
+    #   - a ModelOpt dataset name (e.g. ``cnn_dailymail``) when modelopt is present
+    # NeMo-RL QAOPD recipes use CNN/DailyMail JSONL (or named ``cnn_dailymail``),
+    # not the RL task train split.
+    calib_data: Optional[str] = None
+    # Tokenizer / HF model id used to encode ``calib_data``. Required when
+    # ``calib_data`` is a real dataset/path; ignored for the random fallback.
+    calib_tokenizer: Optional[str] = None
+    # Micro-batch size for dataset calibration forwards.
+    calib_batch_size: int = 1
+    # When False (default), w4a4 with no real ``calib_data`` raises instead of
+    # silently using random-token calibration (NeMo-RL production parity).
+    # Set True or ``calib_data=random`` for unit tests / smoke.
+    allow_random_calib: bool = False
     # Retained for config/Hydra compatibility. When QAT is enabled, rollout
     # weights always come from training-side fold; live weight quantizers on
     # rollout are not supported. ``effective_prefold_weights`` is always True.
@@ -134,6 +151,10 @@ class QATConfig:
     # ``actor_rollout_ref.model.external_lib`` (no separate ``ref.model.external_lib``).
     # Default True for ``w4a16`` so ref stays full precision while actor is quantized.
     skip_ref_quantization: Optional[bool] = None
+    # When True (default), replace ModelOpt's NVFP4 Triton fake-quant kernel with
+    # VeXact's vLLM-aligned implementation so QAT STE matches B200 rollout
+    # ``scaled_fp4_quant`` bit-exactly. Set False to keep stock ModelOpt numerics.
+    use_vllm_nvfp4_kernel: bool = True
 
     def __post_init__(self):
         if self.mode not in VALID_MODES and self.quant_cfg is None:
@@ -158,6 +179,27 @@ class QATConfig:
                 "[vexact-qat] prefold_weights=False is ignored; training-side "
                 "weight fold is mandatory (rollout never runs live weight_quantizer)."
             )
+        if self.calib_size <= 0:
+            raise ValueError(f"QATConfig.calib_size must be > 0, got {self.calib_size}.")
+        if self.calib_seq_len <= 0:
+            raise ValueError(
+                f"QATConfig.calib_seq_len must be > 0, got {self.calib_seq_len}."
+            )
+        if self.calib_batch_size <= 0:
+            raise ValueError(
+                f"QATConfig.calib_batch_size must be > 0, got {self.calib_batch_size}."
+            )
+        if self.calib_data is not None:
+            self.calib_data = str(self.calib_data).strip() or None
+        if self.calib_tokenizer is not None:
+            self.calib_tokenizer = str(self.calib_tokenizer).strip() or None
+
+    @property
+    def uses_dataset_calibration(self) -> bool:
+        """True when a non-random calibration data source is configured."""
+        if not self.calib_data:
+            return False
+        return self.calib_data.strip().lower() not in ("random", "none", "null")
 
     @property
     def effective_calibrate(self) -> bool:
@@ -202,8 +244,13 @@ class QATConfig:
             {prefix}CALIBRATE         -> calibrate         (bool)
             {prefix}CALIB_SIZE        -> calib_size        (int)
             {prefix}CALIB_SEQ_LEN     -> calib_seq_len     (int)
+            {prefix}CALIB_DATA        -> calib_data        (str path / dataset name)
+            {prefix}CALIB_TOKENIZER   -> calib_tokenizer   (str HF path / id)
+            {prefix}CALIB_BATCH_SIZE  -> calib_batch_size  (int)
+            {prefix}ALLOW_RANDOM_CALIB -> allow_random_calib (bool)
             {prefix}PREFOLD_WEIGHTS   -> prefold_weights   (bool)
             {prefix}SKIP_REF        -> skip_ref_quantization (bool)
+            {prefix}VLLM_NVFP4_KERNEL -> use_vllm_nvfp4_kernel (bool)
         """
         kwargs: dict = {"enable": _env_flag(f"{prefix}ENABLE", False)}
 
@@ -231,11 +278,31 @@ class QATConfig:
         if calib_seq_len and calib_seq_len.strip():
             kwargs["calib_seq_len"] = int(calib_seq_len)
 
+        calib_data = os.environ.get(f"{prefix}CALIB_DATA")
+        if calib_data is not None and calib_data.strip():
+            kwargs["calib_data"] = calib_data.strip()
+
+        calib_tokenizer = os.environ.get(f"{prefix}CALIB_TOKENIZER")
+        if calib_tokenizer is not None and calib_tokenizer.strip():
+            kwargs["calib_tokenizer"] = calib_tokenizer.strip()
+
+        calib_batch_size = os.environ.get(f"{prefix}CALIB_BATCH_SIZE")
+        if calib_batch_size and calib_batch_size.strip():
+            kwargs["calib_batch_size"] = int(calib_batch_size)
+
+        allow_random = _env_flag_explicit(f"{prefix}ALLOW_RANDOM_CALIB")
+        if allow_random is not None:
+            kwargs["allow_random_calib"] = allow_random
+
         if os.environ.get(f"{prefix}PREFOLD_WEIGHTS") is not None:
             kwargs["prefold_weights"] = _env_flag(f"{prefix}PREFOLD_WEIGHTS", False)
 
         if os.environ.get(f"{prefix}SKIP_REF") is not None:
             kwargs["skip_ref_quantization"] = _env_flag(f"{prefix}SKIP_REF", False)
+
+        vllm_kernel = _env_flag_explicit(f"{prefix}VLLM_NVFP4_KERNEL")
+        if vllm_kernel is not None:
+            kwargs["use_vllm_nvfp4_kernel"] = vllm_kernel
 
         return cls(**kwargs)
 

@@ -400,6 +400,8 @@ class ModelCreator:
             )
             return
 
+        from dataclasses import replace
+
         from vexact.quantization import quantize_model
         from vexact.quantization.amax_sync import fill_input_amax_sentinel
         from vexact.quantization.fold import (
@@ -414,7 +416,16 @@ class ModelCreator:
             "come from training. Local calib only materializes amax buffers "
             "(eager attn smoke forward), then sentinel-filled until actor refit."
         )
-        quantize_model(self._causal_model, qat_config)
+        # Hydra ``engine_kwargs.vexact.qat`` typically only sets enable/mode/
+        # calibrate; real ``calib_data`` lives on the training-side env
+        # (``QATConfig.from_env``). Rollout amax is discarded via sentinel +
+        # actor refit, so force a cheap random smoke forward here.
+        rollout_qat = replace(
+            qat_config,
+            calib_data="random",
+            allow_random_calib=True,
+        )
+        quantize_model(self._causal_model, rollout_qat)
         disabled = disable_weight_quantizers(self._causal_model)
         # NeMo-RL style: local calib amax is only a placeholder; actor refit wins.
         sentinel_filled = fill_input_amax_sentinel(self._causal_model, value=-1.0)

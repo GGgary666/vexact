@@ -17,6 +17,12 @@
 ``modelopt`` is imported lazily inside the functions here so that importing
 ``vexact.quantization`` never fails in environments without the ``qat`` extra
 installed. Only enabling QAT pulls modelopt in.
+
+For NVFP4 (``w4a4`` / ``w4a16``), :func:`quantize_model` installs VeXact's
+vLLM-aligned Triton fake-quant kernel in place of ModelOpt's
+``fp4_fake_quant_block`` (see :mod:`vexact.quantization.nvfp4.modelopt_patch`)
+so STE numerics match B200 ``scaled_fp4_quant``. Disable with
+``QATConfig.use_vllm_nvfp4_kernel=False`` or ``VEXACT_QAT_VLLM_NVFP4_KERNEL=0``.
 """
 
 from __future__ import annotations
@@ -38,6 +44,31 @@ ForwardLoop = Callable[[nn.Module], Any]
 
 # Exact modelopt dict-key / list-entry pattern for per-layer input quantizers.
 _W4A16_INPUT_QUANTIZER_PATTERN = "*input_quantizer"
+
+
+def _maybe_install_vllm_nvfp4_kernel(qat_config: QATConfig) -> None:
+    """Swap ModelOpt NVFP4 Triton fake-quant for VeXact's vLLM-aligned kernel."""
+    if not qat_config.use_vllm_nvfp4_kernel:
+        return
+    # Only NVFP4 modes (w4a4 / w4a16) use fp4_fake_quant_block.
+    cfg_name = qat_config.resolved_cfg_name()
+    if "NVFP4" not in cfg_name.upper() and qat_config.mode not in ("w4a4", "w4a16"):
+        return
+    try:
+        from vexact.quantization.nvfp4 import install_vllm_aligned_nvfp4_kernel
+
+        ok = install_vllm_aligned_nvfp4_kernel()
+        if not ok:
+            logger.warning(
+                "[vexact-qat] use_vllm_nvfp4_kernel=True but patch install failed; "
+                "falling back to stock ModelOpt NVFP4 numerics."
+            )
+    except Exception:  # pragma: no cover - best-effort
+        logger.warning(
+            "[vexact-qat] Failed to install vLLM-aligned NVFP4 kernel; "
+            "using stock ModelOpt numerics.",
+            exc_info=True,
+        )
 
 
 def _require_modelopt():
@@ -253,6 +284,254 @@ def _random_calibration_forward_loop(qat_config: QATConfig) -> ForwardLoop:
     return forward_loop
 
 
+_JSONL_TEXT_KEYS = (
+    "text",
+    "article",
+    "content",
+    "document",
+    "prompt",
+    "question",
+    "input",
+)
+
+
+def _extract_jsonl_text(record: dict[str, Any]) -> Optional[str]:
+    for key in _JSONL_TEXT_KEYS:
+        value = record.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    # Nested CNN/DailyMail style: {"article": "..."} already covered; also
+    # accept a single-string payload under uncommon keys.
+    for value in record.values():
+        if isinstance(value, str) and len(value.strip()) >= 8:
+            return value.strip()
+    return None
+
+
+def _load_jsonl_texts(path: str, max_samples: int) -> list[str]:
+    import json
+    from pathlib import Path
+
+    file_path = Path(path)
+    if not file_path.is_file():
+        raise FileNotFoundError(
+            f"[vexact-qat] Calibration data file not found: {path}"
+        )
+    texts: list[str] = []
+    with file_path.open("r", encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"[vexact-qat] Invalid JSON on line {line_no} of {path}: {exc}"
+                ) from exc
+            if not isinstance(record, dict):
+                raise ValueError(
+                    f"[vexact-qat] Expected a JSON object on line {line_no} of {path}, "
+                    f"got {type(record).__name__}."
+                )
+            text = _extract_jsonl_text(record)
+            if text is None:
+                continue
+            texts.append(text)
+            if len(texts) >= max_samples:
+                break
+    if not texts:
+        raise ValueError(
+            f"[vexact-qat] No usable text fields found in {path}. "
+            f"Expected one of {_JSONL_TEXT_KEYS}."
+        )
+    return texts
+
+
+def _load_tokenizer(tokenizer_path: str):
+    try:
+        from transformers import AutoTokenizer
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError(
+            "[vexact-qat] Dataset calibration requires transformers. "
+            "Install the veomni/verl extras."
+        ) from exc
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+    return tokenizer
+
+
+def _try_modelopt_dataset_dataloader(qat_config: QATConfig, device: torch.device):
+    """Best-effort ModelOpt dataset path (cnn_dailymail, etc.). Returns None on miss."""
+    if not qat_config.calib_tokenizer:
+        return None
+    try:
+        from modelopt.torch.utils.dataset_utils import (
+            create_forward_loop,
+            get_dataset_dataloader,
+        )
+    except ImportError:
+        return None
+
+    try:
+        tokenizer = _load_tokenizer(qat_config.calib_tokenizer)
+        dataloader = get_dataset_dataloader(
+            dataset_name=qat_config.calib_data,
+            tokenizer=tokenizer,
+            batch_size=qat_config.calib_batch_size,
+            num_samples=qat_config.calib_size,
+            device=device,
+            include_labels=False,
+            max_sample_length=qat_config.calib_seq_len,
+        )
+        return create_forward_loop(dataloader=dataloader)
+    except Exception as exc:
+        logger.info(
+            "[vexact-qat] ModelOpt dataset loader unavailable for %r (%s); "
+            "falling back to JSONL/local path handling.",
+            qat_config.calib_data,
+            exc,
+        )
+        return None
+
+
+def _jsonl_calibration_forward_loop(qat_config: QATConfig) -> ForwardLoop:
+    """Build a calibration loop from a local JSONL text file."""
+    if not qat_config.calib_tokenizer:
+        raise ValueError(
+            "[vexact-qat] calib_tokenizer is required when calib_data points to a "
+            "JSONL file or custom dataset path."
+        )
+    texts = _load_jsonl_texts(qat_config.calib_data, qat_config.calib_size)
+    tokenizer = _load_tokenizer(qat_config.calib_tokenizer)
+    batch_size = max(1, int(qat_config.calib_batch_size))
+    max_len = max(1, int(qat_config.calib_seq_len))
+
+    def forward_loop(model: nn.Module) -> None:
+        try:
+            device = next(model.parameters()).device
+        except StopIteration:  # pragma: no cover
+            device = torch.device("cpu")
+        prev_attn = _force_eager_attention(model)
+        try:
+            with torch.no_grad():
+                for start in range(0, len(texts), batch_size):
+                    batch_texts = texts[start : start + batch_size]
+                    encoded = tokenizer(
+                        batch_texts,
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True,
+                        max_length=max_len,
+                    )
+                    input_ids = encoded["input_ids"].to(device)
+                    attention_mask = encoded.get("attention_mask")
+                    kwargs = {"input_ids": input_ids, "use_cache": False}
+                    if attention_mask is not None:
+                        kwargs["attention_mask"] = attention_mask.to(device)
+                    model(**kwargs)
+        finally:
+            _restore_attention(model, prev_attn)
+
+    return forward_loop
+
+
+def build_calibration_forward_loop(qat_config: QATConfig) -> ForwardLoop:
+    """Select random / JSONL / ModelOpt dataset calibration forward loop.
+
+    Resolution order when ``calibrate=True`` and no caller-provided loop:
+
+    1. ``calib_data`` empty / ``random`` -> random-token fallback
+    2. Existing local file path -> JSONL text calibration
+    3. ModelOpt named dataset (requires ``calib_tokenizer``)
+    4. Otherwise fail-fast with a clear error
+    """
+    if not qat_config.uses_dataset_calibration:
+        return _random_calibration_forward_loop(qat_config)
+
+    from pathlib import Path
+
+    data = qat_config.calib_data
+    assert data is not None
+
+    if Path(data).is_file():
+        logger.info(
+            "[vexact-qat] Using JSONL calibration data=%s size=%d seq_len=%d batch=%d",
+            data,
+            qat_config.calib_size,
+            qat_config.calib_seq_len,
+            qat_config.calib_batch_size,
+        )
+        return _jsonl_calibration_forward_loop(qat_config)
+
+    # Named ModelOpt dataset (e.g. cnn_dailymail) — needs a device later; wrap.
+    def _deferred(model: nn.Module) -> None:
+        try:
+            device = next(model.parameters()).device
+        except StopIteration:  # pragma: no cover
+            device = torch.device("cpu")
+        modelopt_loop = _try_modelopt_dataset_dataloader(qat_config, device)
+        if modelopt_loop is None:
+            raise FileNotFoundError(
+                f"[vexact-qat] Calibration data {data!r} is neither an existing "
+                f"file nor a loadable ModelOpt dataset. Provide a JSONL path via "
+                f"VEXACT_QAT_CALIB_DATA / QATConfig.calib_data, or set "
+                f"calib_data=random."
+            )
+        prev_attn = _force_eager_attention(model)
+        try:
+            with torch.no_grad():
+                modelopt_loop(model)
+        finally:
+            _restore_attention(model, prev_attn)
+
+    logger.info(
+        "[vexact-qat] Using ModelOpt/named calibration dataset=%s size=%d",
+        data,
+        qat_config.calib_size,
+    )
+    return _deferred
+
+
+def resolve_calibration_forward_loop(
+    qat_config: QATConfig,
+    forward_loop: Optional[ForwardLoop] = None,
+) -> Optional[ForwardLoop]:
+    """Return the forward loop to pass to ``mtq.quantize``, or None if disabled."""
+    if not qat_config.effective_calibrate:
+        return None
+    if forward_loop is not None:
+        return forward_loop
+    if qat_config.uses_dataset_calibration:
+        return build_calibration_forward_loop(qat_config)
+
+    # Explicit ``calib_data=random`` or allow_random_calib opt-in (tests / smoke).
+    explicit_random = (
+        qat_config.calib_data is not None
+        and str(qat_config.calib_data).strip().lower() == "random"
+    )
+    if explicit_random or qat_config.allow_random_calib:
+        logger.warning(
+            "[vexact-qat] Using random-token calibration fallback "
+            "(calib_data=%r allow_random_calib=%s). Prefer CNN/DailyMail JSONL "
+            "or ModelOpt named dataset (e.g. cnn_dailymail) for production w4a4.",
+            qat_config.calib_data,
+            qat_config.allow_random_calib,
+        )
+        return _random_calibration_forward_loop(qat_config)
+
+    raise ValueError(
+        "[vexact-qat] w4a4 calibration requires a real calib dataset "
+        "(NeMo-RL parity). Set VEXACT_QAT_CALIB_DATA to a JSONL path "
+        "(e.g. cnn_dailymail_calib.jsonl with {\"text\": ...}) or a ModelOpt "
+        "named dataset (cnn_dailymail), plus VEXACT_QAT_CALIB_TOKENIZER. "
+        "For tests/smoke only: VEXACT_QAT_CALIB_DATA=random or "
+        "VEXACT_QAT_ALLOW_RANDOM_CALIB=1."
+    )
+
+
 def quantize_model(
     model: nn.Module,
     qat_config: QATConfig,
@@ -265,7 +544,8 @@ def quantize_model(
         qat_config: resolved QAT settings shared across train/infer sides.
         forward_loop: optional calibration callable ``fn(model) -> None``. When
             ``qat_config.effective_calibrate`` is True and this is None, a
-            lightweight random-token calibration loop is used as a fallback.
+            dataset loop (if ``calib_data`` is set) or random-token fallback
+            is used.
 
     Returns:
         The same model object, now quantized. Idempotent: if the model is
@@ -285,7 +565,12 @@ def quantize_model(
 
     if is_model_quantized(model):
         logger.info("[vexact-qat] Model already quantized; skipping quantize_model().")
+        # Still (re)install the kernel patch so subsequent STE forwards use
+        # vLLM-aligned numerics even if quantizers were inserted earlier.
+        _maybe_install_vllm_nvfp4_kernel(qat_config)
         return model
+
+    _maybe_install_vllm_nvfp4_kernel(qat_config)
 
     mtq_cfg = resolve_quant_cfg(qat_config)
     cfg_name = qat_config.resolved_cfg_name()
@@ -298,13 +583,7 @@ def quantize_model(
         )
 
     if do_calibrate:
-        if forward_loop is None:
-            logger.warning(
-                "[vexact-qat] calibrate=True but no forward_loop provided; using a "
-                "random-token calibration fallback. Prefer a real calib dataset "
-                "for production w4a4 runs."
-            )
-            forward_loop = _random_calibration_forward_loop(qat_config)
+        forward_loop = resolve_calibration_forward_loop(qat_config, forward_loop)
     else:
         if _needs_calibration(mtq_cfg):
             logger.info(
@@ -316,11 +595,14 @@ def quantize_model(
         forward_loop = None
 
     logger.info(
-        "[vexact-qat] Quantizing model: mode=%s cfg=%s ignore=%s calibrate=%s",
+        "[vexact-qat] Quantizing model: mode=%s cfg=%s ignore=%s calibrate=%s "
+        "calib_data=%s vllm_nvfp4_kernel=%s",
         qat_config.mode,
         cfg_name,
         qat_config.ignore_patterns,
         do_calibrate,
+        qat_config.calib_data,
+        qat_config.use_vllm_nvfp4_kernel,
     )
 
     model = mtq.quantize(model, mtq_cfg, forward_loop)
@@ -329,5 +611,32 @@ def quantize_model(
         mtq.print_quant_summary(model)
     except Exception:  # pragma: no cover - summary is best-effort
         logger.debug("[vexact-qat] print_quant_summary failed", exc_info=True)
+
+    if do_calibrate:
+        from vexact.quantization.scale_monitor import (
+            assert_calib_frozen,
+            get_quantizer_stats,
+            log_scale_monitor,
+        )
+
+        # ModelOpt max calib ends with load_calib_amax + disable_calib so the
+        # per-tensor amax (NVFP4 global_scale source) stays frozen.
+        try:
+            assert_calib_frozen(model)
+        except RuntimeError:
+            logger.warning(
+                "[vexact-qat] calib_frozen check failed after mtq.quantize; "
+                "global_scale may still update if calib stays enabled.",
+                exc_info=True,
+            )
+        stats = get_quantizer_stats(model)
+        if stats["enabled"] > 0 and stats["positive_amax"] < stats["with_amax"]:
+            logger.warning(
+                "[vexact-qat] Some enabled quantizers have non-positive amax "
+                "(with_amax=%d positive_amax=%d).",
+                stats["with_amax"],
+                stats["positive_amax"],
+            )
+        log_scale_monitor(model, prefix="[vexact-qat] post-calib")
 
     return model
