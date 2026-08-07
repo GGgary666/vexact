@@ -18,6 +18,36 @@ import torch
 from vexact.batch_invariant_ops import set_batch_invariant_mode
 
 
+def _skip_if_mm_unsupported(dtype: torch.dtype, device: torch.device) -> None:
+    if dtype is not torch.bfloat16:
+        return
+    try:
+        torch.mm(
+            torch.ones((2, 2), dtype=dtype, device=device),
+            torch.ones((2, 2), dtype=dtype, device=device),
+        )
+    except (RuntimeError, TypeError):
+        pytest.skip(f"torch.mm does not support {dtype} on {device.type}")
+
+
+def _mm_inputs(
+    dtype: torch.dtype,
+    batch: int,
+    dim: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    a = torch.linspace(-1.0, 1.0, batch * dim, dtype=dtype, device=device).reshape(batch, dim)
+    b = torch.linspace(-1.0, 1.0, dim * dim, dtype=dtype, device=device).reshape(dim, dim)
+    return a, b
+
+
+def _mm_batch_drift(a: torch.Tensor, b: torch.Tensor, row: int = 0) -> float:
+    """Max abs diff between single-row mm and the same row from full-batch mm."""
+    single = torch.mm(a[row : row + 1], b)
+    batched = torch.mm(a, b)[row : row + 1]
+    return (single - batched).abs().max().float().item()
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="Batch invariant overrides require CUDA kernels",
@@ -26,21 +56,10 @@ from vexact.batch_invariant_ops import set_batch_invariant_mode
 @pytest.mark.parametrize("batch, dim", [(32, 256), (64, 512), (128, 1024)])
 def test_mm_batch_invariance(dtype: torch.dtype, batch: int, dim: int) -> None:
     device = torch.device("cuda")
-
-    if dtype is torch.bfloat16:
-        try:
-            torch.mm(
-                torch.ones((2, 2), dtype=dtype, device=device),
-                torch.ones((2, 2), dtype=dtype, device=device),
-            )
-        except (RuntimeError, TypeError):
-            pytest.skip(f"torch.mm does not support {dtype} on {device.type}")
-
-    a = torch.linspace(-1.0, 1.0, batch * dim, dtype=dtype, device=device).reshape(batch, dim)
-    b = torch.linspace(-1.0, 1.0, dim * dim, dtype=dtype, device=device).reshape(dim, dim)
+    _skip_if_mm_unsupported(dtype, device)
+    a, b = _mm_inputs(dtype, batch, dim, device)
 
     with set_batch_invariant_mode(True):
-        single_token = torch.mm(a[:1], b)
-        full_batch = torch.mm(a, b)[:1]
+        drift = _mm_batch_drift(a, b, row=0)
 
-    assert torch.allclose(single_token, full_batch, atol=0.0, rtol=0.0)
+    assert drift == 0.0
