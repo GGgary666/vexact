@@ -83,14 +83,17 @@ class CudaGraphManager:
 
     @staticmethod
     def build_capture_sizes(max_size: int | None) -> list[int]:
-        if max_size <= 0:
-            raise ValueError(f"max_size must be positive or None, got {max_size}")
+        if max_size is None or max_size <= 0:
+            raise ValueError(f"max_size must be positive, got {max_size}")
         sizes: list[int] = []
         size = 1
         while size < max_size:
             sizes.append(size)
             size *= 2
-        sizes.append(size)
+        # Cap the final bucket at max_size. Using the next power-of-two when
+        # max_size is not itself a power of two (e.g. 1537 → 2048) exceeds
+        # InputBuffers.max_num_batched_tokens and breaks capture.
+        sizes.append(max_size)
         return sizes
 
     def capture_graphs(self) -> None:
