@@ -16,7 +16,19 @@ examples/
 ```
 
 Local / cluster experiment launchers (including QAOPD) live under ``exp_scripts/``
-(gitignored). QAOPD GSM8K recipe: ``exp_scripts/qaopd/run_qwen3_1b7_gsm8k.sh``.
+(gitignored). QAOPD GSM8K recipes under ``exp_scripts/qaopd/``:
+
+- ``run_qwen3_1b7_gsm8k.sh`` — pure distill
+  (``use_task_rewards=False``, ``rollout.n=1``)
+- ``run_qwen3_1b7_gsm8k_distill_n4.sh`` — pure distill control with ``n=4``
+  (``use_task_rewards=False``; isolates sampling multiplicity vs GRPO joint)
+- ``run_qwen3_1b7_gsm8k_grpo_joint.sh`` — GRPO + distill
+  (``L = L_GRPO + λ * qaopd_mixed_kl_topk``, default ``λ=1.0``,
+  ``rollout.n=4``, ``use_policy_gradient=False``, ``reward_manager=dapo``).
+  Keep fixed input ``global_scale``.
+
+If ``|pg_loss|`` and ``|distillation/loss|`` differ by ≥10× in the first ~50
+steps, retune ``DISTILLATION_LOSS_COEF``.
 
 QAOPD default layout (8 GPUs): student VeXact W4A4 on GPUs 0–3; **teacher VeXact BF16**
 (no QAT) on GPUs 4–7 as **4×1-GPU replicas** (not TP=4). External modules load order:

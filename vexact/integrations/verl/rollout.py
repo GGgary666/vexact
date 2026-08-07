@@ -16,7 +16,7 @@
 import logging
 import os
 import time
-from typing import Generator
+from typing import Generator, Optional
 
 import ray
 import torch
@@ -64,6 +64,92 @@ def _amax_applied_from_receive_result(result) -> int:
     return 0
 
 
+# Baseline input global_scale fingerprint (name -> scale); set on first monitor log.
+_input_global_scale_baseline = None  # type: Optional[dict]
+
+
+def _scale_monitor_every() -> int:
+    """Log global_scale drift every N QAT sync steps (env ``VEXACT_QAT_SCALE_LOG_EVERY``)."""
+    raw = os.environ.get("VEXACT_QAT_SCALE_LOG_EVERY", "50")
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 50
+
+
+def _maybe_log_input_global_scale_drift(iq_map: dict, *, step: int) -> None:
+    """Periodically log input global_scale stats and drift vs post-calib baseline."""
+    global _input_global_scale_baseline
+    if step % _scale_monitor_every() != 0:
+        return
+    try:
+        from vexact.quantization.scale_monitor import (
+            _NVFP4_GLOBAL_SCALE_DENOM,
+            amax_to_global_scale,
+        )
+    except Exception:  # pragma: no cover
+        return
+
+    scales: list[float] = []
+    current: dict[str, float] = {}
+    for name, iq in iq_map.items():
+        amax = getattr(iq, "amax", None)
+        if amax is None:
+            continue
+        scale = float(amax_to_global_scale(amax).amax().item())
+        current[name] = scale
+        scales.append(scale)
+
+    if not scales:
+        return
+
+    import statistics as st
+
+    logger.info(
+        "[vexact-qat] step=%s input global_scale[min/mean/max]=%.6g/%.6g/%.6g (n=%d)",
+        step,
+        min(scales),
+        st.mean(scales),
+        max(scales),
+        len(scales),
+    )
+
+    if _input_global_scale_baseline is None:
+        _input_global_scale_baseline = dict(current)
+        logger.info(
+            "[vexact-qat] step=%s recorded input global_scale baseline (n=%d, denom=%.1f)",
+            step,
+            len(current),
+            _NVFP4_GLOBAL_SCALE_DENOM,
+        )
+        return
+
+    drifted = 0
+    max_rel = 0.0
+    for name, scale in current.items():
+        base = _input_global_scale_baseline.get(name)
+        if base is None or base == 0.0:
+            continue
+        rel = abs(scale - base) / abs(base)
+        max_rel = max(max_rel, rel)
+        if rel > 1e-5:
+            drifted += 1
+    if drifted:
+        logger.warning(
+            "[vexact-qat] step=%s input global_scale drift vs baseline: "
+            "changed=%d/%d max_rel=%.3e (expected frozen after calib)",
+            step,
+            drifted,
+            len(current),
+            max_rel,
+        )
+    else:
+        logger.info(
+            "[vexact-qat] step=%s input global_scale frozen vs baseline (ok)",
+            step,
+        )
+
+
 class ServerAdapter(BaseRollout):
     """
     VeXact server adapter for async mode, serves as a client to request VeXact server
@@ -93,8 +179,17 @@ class ServerAdapter(BaseRollout):
         assert rollout_world_size == device_mesh.size() // device_mesh["dp"].size()
         assert self.replica_rank == device_mesh["dp"].get_local_rank()
 
-        # ZMQ handle for weight transfer, must match Worker.receive_weights
-        driver_id = f"verl_rollout_replica_{self.replica_rank}"
+        # ZMQ handle for weight transfer, must match Worker.receive_weights /
+        # VeXactServer driver_id (role-qualified student names).
+        from vexact.integrations.verl.role_names import build_vexact_role_names
+
+        driver_id = build_vexact_role_names(
+            replica_rank=self.replica_rank,
+            node_rank=self.node_rank,
+            is_teacher_model=False,
+            is_reward_model=False,
+            name_suffix="",
+        )["driver_id"]
         self.zmq_handle = f"ipc:///tmp/vexact-weight-{driver_id}-{self.rollout_rank}.sock"
         logger.info(f"Sender:{self.zmq_handle=}:{get_torch_device().get_device_properties(get_device_id()).uuid}")
 
@@ -106,7 +201,16 @@ class ServerAdapter(BaseRollout):
         """Lazy init server handle because server is launched after hybrid engine."""
         if self.server_handle is None:
             # Async server handle, must match async server ray actor name
-            self.server_handle = ray.get_actor(f"vexact_server_{self.replica_rank}_{self.node_rank}")
+            from vexact.integrations.verl.role_names import build_vexact_role_names
+
+            server_name = build_vexact_role_names(
+                replica_rank=self.replica_rank,
+                node_rank=self.node_rank,
+                is_teacher_model=False,
+                is_reward_model=False,
+                name_suffix="",
+            )["server_name"]
+            self.server_handle = ray.get_actor(server_name)
         return self.server_handle
 
     async def resume(self, tags: list[str]):
@@ -214,6 +318,7 @@ class ServerAdapter(BaseRollout):
                     attached,
                     applied,
                 )
+                _maybe_log_input_global_scale_drift(iq_map, step=step)
             elapsed = time.perf_counter() - t0
             logger.info(
                 "[vexact-qat] step=%s update_weights end (elapsed=%.2fs)",

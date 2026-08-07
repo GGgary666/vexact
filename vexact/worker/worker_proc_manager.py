@@ -105,7 +105,8 @@ class WorkerProcManager:
             ready_reader.close()
             if status != "READY":
                 self.close()
-                raise RuntimeError(f"Worker rank={rank} failed to start")
+                detail = status if isinstance(status, str) else repr(status)
+                raise RuntimeError(f"Worker rank={rank} failed to start: {detail}")
             logger.info(f"Worker rank={rank} ready")
 
         self._monitor_thread = threading.Thread(
@@ -163,9 +164,14 @@ class WorkerProcManager:
             ready_pipe.send("READY")
             ready_pipe.close()
             shutdown_event.wait()
-        except Exception:
+        except Exception as exc:
+            # Subprocess logging may not reach Ray actor stdout; print + pipe
+            # the exception so the parent RuntimeError carries the real cause.
+            import traceback
+
             logger.exception(f"{proxy_cls.__name__} rank={rank} failed")
-            ready_pipe.send("FAILED")
+            traceback.print_exc()
+            ready_pipe.send(f"FAILED: {type(exc).__name__}: {exc}")
             ready_pipe.close()
         finally:
             death_pipe.close()

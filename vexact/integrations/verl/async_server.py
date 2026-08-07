@@ -35,11 +35,13 @@ from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.utils import get_max_position_embeddings
 
-from .rollout import ServerAdapter
+from .placement_worker import VeXactPlacementWorker
+from .role_names import build_vexact_role_names
 
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
 
 
 class VeXactServer:
@@ -59,6 +61,9 @@ class VeXactServer:
         gpus_per_node: int,
         nnodes: int,
         cuda_visible_devices: str,
+        is_teacher_model: bool = False,
+        is_reward_model: bool = False,
+        name_suffix: str = "",
     ):
         """
         Args:
@@ -71,6 +76,9 @@ class VeXactServer:
             gpus_per_node: Number of GPUs per node.
             nnodes: Number of nodes.
             cuda_visible_devices: CUDA visible devices string.
+            is_teacher_model: Whether this server is a distillation teacher.
+            is_reward_model: Whether this server is a reward model replica.
+            name_suffix: Pinned-VeRL suffix (already includes leading ``_`` when set).
         """
         os.environ[get_visible_devices_keyword()] = cuda_visible_devices
 
@@ -94,6 +102,16 @@ class VeXactServer:
         self.node_rank = node_rank
         self.gpus_per_node = gpus_per_node
         self.nnodes = nnodes
+        self.is_teacher_model = bool(is_teacher_model)
+        self.is_reward_model = bool(is_reward_model)
+        self.name_suffix = name_suffix or ""
+        self._role_names = build_vexact_role_names(
+            replica_rank=replica_rank,
+            node_rank=node_rank,
+            is_teacher_model=self.is_teacher_model,
+            is_reward_model=self.is_reward_model,
+            name_suffix=self.name_suffix,
+        )
 
         if self.rollout_mode != RolloutMode.HYBRID and self.config.load_format == "dummy":
             logger.warning(f"rollout mode is {self.rollout_mode}, load_format is dummy, set to auto")
@@ -108,7 +126,8 @@ class VeXactServer:
         self.tokenizer = None
 
         logger.info(
-            f"VeXactServer initialized (replica_rank={replica_rank}, node_rank={node_rank}, "
+            f"VeXactServer initialized (role={self._role_names['role']}, "
+            f"replica_rank={replica_rank}, node_rank={node_rank}, "
             f"{get_visible_devices_keyword()}: {cuda_visible_devices}, "
             f"gpus_per_node={gpus_per_node}, nnodes={nnodes}, "
             f"max_model_len={self.config.max_model_len})"
@@ -143,6 +162,15 @@ class VeXactServer:
 
         attn_impl = engine_kwargs.pop("attn_impl", os.environ.get("INFER_FA_IMPL", "fa-invariant"))
 
+        # Default True (TIM baseline). Set False via
+        # ``++...engine_kwargs.vexact.enable_batch_invariant=False`` for ablations
+        # that keep QAT but disable batch-invariant ATen replacements.
+        _ebi = engine_kwargs.pop("enable_batch_invariant", True)
+        if isinstance(_ebi, str):
+            enable_batch_invariant = _ebi.strip().lower() in ("1", "true", "yes", "on")
+        else:
+            enable_batch_invariant = bool(_ebi)
+
         # QAT / fake quantization config for the rollout side. Provided via
         # ``++actor_rollout_ref.rollout.engine_kwargs.vexact.qat.*`` and must
         # match the training-side config (see fsdp_enable_qat.py) so both sides
@@ -150,6 +178,40 @@ class VeXactServer:
         qat_config = QATConfig.from_dict(engine_kwargs.pop("qat", None))
         if qat_config is not None:
             logger.info(f"[vexact] Rollout QAT enabled: {qat_config}")
+        if not enable_batch_invariant:
+            logger.info(
+                "[vexact] enable_batch_invariant=False "
+                "(batch-invariant ATen replacements disabled on rollout)."
+            )
+
+        if self.is_teacher_model:
+            tp = int(getattr(self.config, "tensor_model_parallel_size", 1) or 1)
+            dp = int(getattr(self.config, "data_parallel_size", 1) or 1)
+            pp = int(getattr(self.config, "pipeline_model_parallel_size", 1) or 1)
+            if tp != 1 or dp != 1 or pp != 1:
+                raise ValueError(
+                    "VeXact distillation teacher requires TP=DP=PP=1 in the first version "
+                    f"(got tensor_model_parallel_size={tp}, data_parallel_size={dp}, "
+                    f"pipeline_model_parallel_size={pp}). Use multiple single-GPU replicas."
+                )
+            if qat_config is not None and getattr(qat_config, "enable", False):
+                raise ValueError(
+                    "VeXact distillation teacher must run BF16 without QAT "
+                    f"(got qat.enable={qat_config.enable})"
+                )
+            # Teacher is frozen BF16; refuse non-bf16 overrides if present.
+            dtype = getattr(self.model_config, "dtype", None) or getattr(
+                getattr(self.model_config, "hf_config", None), "torch_dtype", None
+            )
+            dtype_name = str(dtype).lower() if dtype is not None else "bfloat16"
+            if "bfloat16" not in dtype_name and "bf16" not in dtype_name:
+                raise ValueError(
+                    f"VeXact distillation teacher requires BF16 dtype, got dtype={dtype!r}"
+                )
+            logger.info(
+                "[vexact] role=teacher dtype=bf16 qat=disabled "
+                f"replica_rank={self.replica_rank} driver_id={self._role_names['driver_id']}"
+            )
 
         # Honor rollout.enforce_eager as-is (NeMo-RL QARL style): w4a16 is plain
         # BF16 Linear after fold; w4a4 keeps input_quantizer but disables WQ so
@@ -179,7 +241,7 @@ class VeXactServer:
                 model_path=self.model_config.local_path,
                 attn_impl=attn_impl,
                 max_model_len=self.config.max_model_len,
-                enable_batch_invariant=True,
+                enable_batch_invariant=enable_batch_invariant,
                 enable_memory_saver=self.config.free_cache_engine,
                 enforce_eager=rollout_enforce_eager,
                 use_fp32_logits=self.model_config.use_fused_kernels,
@@ -194,17 +256,17 @@ class VeXactServer:
             ),
             driver=DriverConfig(
                 is_worker_proc_managed=True,
-                driver_id=f"verl_rollout_replica_{self.replica_rank}",
+                driver_id=self._role_names["driver_id"],
             ),
             cache=CacheConfig(max_cache_blocks=engine_kwargs.get("max_cache_blocks", 1024)),
             profiler=ProfilerConfig(
-                backend="torch" if self.config.profiler.enable else None,
+                backend="torch" if getattr(self.config.profiler, "enable", False) else None,
                 delay_iterations=10000,  # delay some iterations to skip prefill stage
                 max_iterations=200,
-                output_path=self.config.profiler.save_path,
+                output_path=getattr(self.config.profiler, "save_path", None),
                 profile_all_ranks=True,
             ),
-            quantization=qat_config,
+            quantization=None if self.is_teacher_model else qat_config,
         )
 
         self.engine = VeXact(vexact_config)
@@ -241,10 +303,79 @@ class VeXactServer:
         priority: int = 0,  # noqa: ARG002
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
-        from vexact.core.request import DriverRequest
+        from vexact.core.request import DriverRequest, RequestStatus
+        from vexact.inferencer.prompt_logprobs import validate_prompt_logprobs_params
 
         if image_data is not None or video_data is not None:
             logger.warning("image_data and video_data not supported by VeXact, ignoring")
+
+        sampling_params = dict(sampling_params)
+        # Teacher scoring path: pop before generation asserts (pinned VeRL sends max_tokens=1).
+        prompt_logprobs = sampling_params.pop("prompt_logprobs", None)
+        sampling_params.pop("max_tokens", None)
+
+        if prompt_logprobs is not None:
+            if not self.is_teacher_model:
+                raise RuntimeError(
+                    "prompt_logprobs scoring is only supported on VeXact teacher servers "
+                    f"(request_id={request_id})"
+                )
+            k = int(prompt_logprobs)
+            temperature = float(sampling_params.pop("temperature", self.config.temperature))
+            validate_prompt_logprobs_params(
+                seq_len=len(prompt_ids),
+                k=k,
+                vocab_size=int(getattr(self.tokenizer, "vocab_size", 0) or 0)
+                or int(getattr(self.model_config.hf_config, "vocab_size", 0)),
+                temperature=temperature,
+            )
+            # Drain unused teacher sampling keys.
+            for key in ("top_p", "top_k", "repetition_penalty", "do_sample", "seed", "logprobs"):
+                sampling_params.pop(key, None)
+            if sampling_params:
+                logger.warning(f"Remaining sampling_params ignored for score-only: {sampling_params}")
+
+            gen_config = GenerationConfig(
+                max_new_tokens=1,
+                max_length=len(prompt_ids) + 1,
+                do_sample=False,
+                temperature=1.0,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self._eos_token_id,
+            )
+            request = DriverRequest(
+                request_id=request_id,
+                generation_config=gen_config,
+                input_ids_list=prompt_ids,
+                score_only=True,
+                prompt_logprobs_k=k,
+            )
+            result = await self.engine.generate(request)
+            if result.status == RequestStatus.FAILED or getattr(result, "is_failed", False):
+                raise RuntimeError(
+                    f"VeXact teacher scoring FAILED for request_id={request_id}: "
+                    f"{result.reason or 'unknown error'}"
+                )
+            if not result.prompt_ids or not result.prompt_logprobs:
+                raise RuntimeError(
+                    f"VeXact teacher scoring returned empty prompt_logprobs for request_id={request_id}"
+                )
+            if len(result.prompt_ids) != len(prompt_ids):
+                raise RuntimeError(
+                    f"prompt_ids length mismatch for request_id={request_id}: "
+                    f"got {len(result.prompt_ids)}, expected {len(prompt_ids)}"
+                )
+            return TokenOutput(
+                token_ids=[],
+                log_probs=None,
+                routed_experts=None,
+                stop_reason="completed",
+                num_preempted=None,
+                extra_fields={
+                    "prompt_ids": result.prompt_ids,
+                    "prompt_logprobs": result.prompt_logprobs,
+                },
+            )
 
         max_possible_tokens = self.config.max_model_len - len(prompt_ids)
         if max_possible_tokens < 0:
@@ -272,6 +403,12 @@ class VeXactServer:
         if sampling_params:
             logger.warning(f"Remaining sampling_params not supported: {sampling_params}")
 
+        if self.is_teacher_model:
+            raise RuntimeError(
+                "VeXact teacher server only supports prompt_logprobs scoring requests, "
+                f"not generation (request_id={request_id})"
+            )
+
         gen_config = GenerationConfig(
             max_new_tokens=max_tokens,
             max_length=len(prompt_ids) + max_tokens,
@@ -297,6 +434,11 @@ class VeXactServer:
         )
 
         result = await self.engine.generate(request)
+        if result.status == RequestStatus.FAILED or getattr(result, "is_failed", False):
+            raise RuntimeError(
+                f"VeXact generate FAILED for request_id={request_id}: "
+                f"{result.reason or 'unknown error'}"
+            )
 
         token_ids = result.new_token_ids
         log_probs = result.new_logprobs if logprobs_requested else None
@@ -379,7 +521,7 @@ class VeXactServer:
         pass
 
 
-_rollout_worker_actor_cls = ray.remote(ServerAdapter)
+_placement_worker_actor_cls = ray.remote(VeXactPlacementWorker)
 
 
 class VeXactReplica(RolloutReplica):
@@ -395,18 +537,24 @@ class VeXactReplica(RolloutReplica):
         model_config: HFModelConfig,
         gpus_per_node: int = 8,
         is_reward_model: bool = False,
+        is_teacher_model: bool = False,
+        name_suffix: str = "",
     ):
-        super().__init__(replica_rank, config, model_config, gpus_per_node, is_reward_model)
+        super().__init__(
+            replica_rank,
+            config,
+            model_config,
+            gpus_per_node,
+            is_reward_model,
+            is_teacher_model,
+            name_suffix,
+        )
         self.server_class = ray.remote(VeXactServer)
 
     def get_ray_class_with_init_args(self) -> RayClassWithInitArgs:
         """Get rollout worker actor class for colocated and standalone mode."""
-        return RayClassWithInitArgs(
-            cls=_rollout_worker_actor_cls,
-            config=self.config,
-            model_config=self.model_config,
-            device_mesh=None,
-        )
+        # Teacher/colocated must not instantiate ServerAdapter(device_mesh=None).
+        return RayClassWithInitArgs(cls=_placement_worker_actor_cls)
 
     async def launch_servers(self):
         """Launch VeXact server in each node."""
@@ -436,11 +584,13 @@ class VeXactReplica(RolloutReplica):
                 worker_cuda_visible_devices[node_rank * gpus_per_replica_node : (node_rank + 1) * gpus_per_replica_node]
             )
             node_id = worker_node_ids[node_rank * gpus_per_replica_node]
-            name = (
-                f"vexact_server_{self.replica_rank}_{node_rank}"
-                if not self.is_reward_model
-                else f"vexact_server_reward_{self.replica_rank}_{node_rank}"
-            )
+            name = build_vexact_role_names(
+                replica_rank=self.replica_rank,
+                node_rank=node_rank,
+                is_teacher_model=self.is_teacher_model,
+                is_reward_model=self.is_reward_model,
+                name_suffix=self.name_suffix,
+            )["server_name"]
 
             server = self.server_class.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
@@ -459,6 +609,9 @@ class VeXactReplica(RolloutReplica):
                 gpus_per_node=gpus_per_replica_node,
                 nnodes=nnodes,
                 cuda_visible_devices=node_cuda_visible_devices,
+                is_teacher_model=self.is_teacher_model,
+                is_reward_model=self.is_reward_model,
+                name_suffix=self.name_suffix,
             )
             self.servers.append(server)
 
