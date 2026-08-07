@@ -176,10 +176,19 @@ def test_maybe_enable_cpa_after_qat_rejects_w4a16(monkeypatch):
         fsdp_enable_qat.maybe_enable_cpa_after_qat(True, qat_cfg)
 
 
+def test_maybe_enable_cpa_after_qat_rejects_qaopd(monkeypatch):
+    monkeypatch.setenv("VEXACT_CPA_ENABLE", "1")
+    monkeypatch.setenv("VEXACT_QAOPD_ENABLE", "1")
+    qat_cfg = QATConfig(enable=True, mode="w4a4")
+    with pytest.raises(RuntimeError, match="conflicts with VEXACT_QAOPD_ENABLE"):
+        fsdp_enable_qat.maybe_enable_cpa_after_qat(True, qat_cfg)
+
+
 def test_maybe_enable_cpa_after_qat_installs_on_w4a4(monkeypatch):
     monkeypatch.setenv("VEXACT_CPA_ENABLE", "1")
     monkeypatch.setenv("VEXACT_CPA_COEF", "0.002")
     monkeypatch.setenv("VEXACT_CPA_LOSS_TYPE", "abs_logprob")
+    monkeypatch.delenv("VEXACT_QAOPD_ENABLE", raising=False)
     qat_cfg = QATConfig(enable=True, mode="w4a4")
     with patch("vexact.integrations.verl.fsdp_enable_cpa.enable_training_cpa", return_value=True) as enable:
         assert fsdp_enable_qat.maybe_enable_cpa_after_qat(True, qat_cfg) is True

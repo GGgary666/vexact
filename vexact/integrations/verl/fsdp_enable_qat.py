@@ -86,6 +86,7 @@ Notes:
 import functools
 import inspect
 import logging
+import os
 import sys
 from typing import Callable
 
@@ -107,19 +108,26 @@ _REF_BUILD_FUNC_MARKERS = (
 )
 
 
-# QAT rollout/training only make sense with VeXact's batch-invariant kernels, and
-# verl's ``import_external_libs`` imports each external_lib entry as-is (it does
-# not split comma-separated strings). To make mounting a single module reliable,
-# pull in the batch-invariant hook here so mounting just ``fsdp_enable_qat``
-# enables both. Guarded so a missing dependency does not abort QAT setup.
-try:
-    from vexact.integrations.verl import fsdp_enable_invariant as _fsdp_enable_invariant  # noqa: F401
-except Exception:  # pragma: no cover - depends on training env
-    logger.warning(
-        "[vexact-qat] Could not import fsdp_enable_invariant; batch-invariant mode "
-        "may be disabled. Mount it explicitly if needed.",
-        exc_info=True,
+# By default, pull in the batch-invariant hook so mounting just ``fsdp_enable_qat``
+# enables both (verl's ``import_external_libs`` does not split comma-separated
+# strings). Set ``VEXACT_BATCH_INVARIANT=0`` to skip — ablation that keeps QAT
+# but disables training-side batch-invariant ATen replacements. Guarded so a
+# missing dependency does not abort QAT setup.
+_batch_invariant_env = os.environ.get("VEXACT_BATCH_INVARIANT", "1").strip().lower()
+if _batch_invariant_env in ("0", "false", "no", "off"):
+    logger.info(
+        "[vexact-qat] VEXACT_BATCH_INVARIANT=%s — skipping fsdp_enable_invariant.",
+        os.environ.get("VEXACT_BATCH_INVARIANT"),
     )
+else:
+    try:
+        from vexact.integrations.verl import fsdp_enable_invariant as _fsdp_enable_invariant  # noqa: F401
+    except Exception:  # pragma: no cover - depends on training env
+        logger.warning(
+            "[vexact-qat] Could not import fsdp_enable_invariant; batch-invariant mode "
+            "may be disabled. Mount it explicitly if needed.",
+            exc_info=True,
+        )
 
 
 def _model_is_meta(model) -> bool:
@@ -238,6 +246,20 @@ def _apply_qat(model, qat_config: QATConfig, context: str):
             len(iq_map),
             n_amax,
         )
+        try:
+            from vexact.quantization.scale_monitor import (
+                fingerprint_input_global_scales,
+                log_scale_monitor,
+            )
+
+            log_scale_monitor(model, prefix=f"[vexact-qat] train-ready ({context})")
+            # Stash fingerprint for later drift checks on update_weights.
+            model._vexact_input_global_scale_fp = fingerprint_input_global_scales(model)
+        except Exception:  # pragma: no cover - monitoring must not break QAT
+            logger.debug(
+                "[vexact-qat] scale monitor after train quantize failed",
+                exc_info=True,
+            )
     else:
         set_training_input_quantizer_map(None)
         if qat_config.mode == "w4a4":
@@ -394,6 +416,7 @@ def maybe_enable_cpa_after_qat(qat_installed: bool, qat_config: QATConfig) -> bo
     Fail-fast rules:
       * CPA enable requires a successful QAT hook install.
       * CPA enable requires ``qat_config.enable`` and ``mode == "w4a4"``.
+      * CPA is incompatible with QAOPD (``VEXACT_QAOPD_ENABLE=1``).
     """
     from vexact.integrations.verl import fsdp_enable_cpa
     from vexact.quantization.cpa import CPAConfig
@@ -401,6 +424,12 @@ def maybe_enable_cpa_after_qat(qat_installed: bool, qat_config: QATConfig) -> bo
     cpa_config = CPAConfig.from_env()
     if not cpa_config.enable:
         return False
+
+    if os.environ.get("VEXACT_QAOPD_ENABLE", "").strip().lower() in ("1", "true", "yes", "on"):
+        raise RuntimeError(
+            "[vexact-cpa] VEXACT_CPA_ENABLE=1 conflicts with VEXACT_QAOPD_ENABLE=1. "
+            "QAOPD uses VeRL on-policy distillation as the sole loss; disable CPA."
+        )
 
     if not qat_installed or not qat_config.enable:
         raise RuntimeError(

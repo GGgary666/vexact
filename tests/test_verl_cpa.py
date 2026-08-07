@@ -14,6 +14,8 @@
 
 """Tests for the VeOmni CPA forward_step wrapper."""
 
+import sys
+import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -85,6 +87,54 @@ def _make_micro_batch(student_lp=None):
         "dp_size": 1,
         "input_ids": torch.ones(1, 4, dtype=torch.long),
     }
+
+
+def test_resolve_compute_device_prefers_student_over_cuda_default(monkeypatch):
+    """On CUDA hosts, CPA must follow student log-prob device (CPU in unit tests)."""
+    student = torch.tensor([[0.0, -1.0]], requires_grad=True)
+    loss = torch.tensor(1.0)
+    model_output = {"log_probs": student}
+
+    # Simulate verl reporting cuda even though tensors are on CPU.
+    fake_device = types.ModuleType("verl.utils.device")
+    fake_device.get_device_id = lambda: torch.device("cuda:0")
+    monkeypatch.setitem(sys.modules, "verl.utils.device", fake_device)
+    # Also ensure parent packages exist if needed.
+    if "verl" not in sys.modules:
+        monkeypatch.setitem(sys.modules, "verl", types.ModuleType("verl"))
+    if "verl.utils" not in sys.modules:
+        monkeypatch.setitem(sys.modules, "verl.utils", types.ModuleType("verl.utils"))
+
+    device = fsdp_enable_cpa._resolve_compute_device(loss, model_output, "cpu")
+    assert device.type == "cpu"
+
+
+def test_align_cpa_tensors_moves_mask_to_student_device():
+    student = torch.tensor([[0.0, -1.0]])
+    teacher = torch.tensor([[0.2, -0.5]])
+    mask = torch.ones(1, 2)
+    if torch.cuda.is_available():
+        mask = mask.cuda()
+    s2, t2, m2 = fsdp_enable_cpa._align_cpa_tensors(student, teacher, mask)
+    assert s2.device == student.device
+    assert t2.device == student.device
+    assert m2.device == student.device
+
+
+def test_metric_value_stays_float_without_pg_metric():
+    assert fsdp_enable_cpa._metric_value(0.5, {}) == 0.5
+    assert fsdp_enable_cpa._metric_value(0.5, {"actor/pg_loss": 1.0}) == 0.5
+
+
+def test_metric_value_wraps_when_pg_loss_is_metric():
+    try:
+        from verl.utils.metric import AggregationType, Metric as VerlMetric
+    except Exception:
+        pytest.skip("verl Metric unavailable")
+    metrics = {"actor/pg_loss": VerlMetric(aggregation=AggregationType.MEAN, value=1.0)}
+    out = fsdp_enable_cpa._metric_value(0.25, metrics)
+    assert isinstance(out, VerlMetric)
+    assert out.aggregate() == pytest.approx(0.25)
 
 
 def test_wrap_forward_step_adds_cpa_on_train_path():

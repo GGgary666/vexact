@@ -60,16 +60,20 @@ def _default_to_response_log_probs(log_probs, data):
 
 
 def _metric_value(value: float, metrics: dict) -> Any:
-    """Wrap ``value`` as verl ``Metric`` when the surrounding metrics use it."""
+    """Wrap ``value`` as verl ``Metric`` only when surrounding metrics already use it.
+
+    Unit tests and older verl paths store plain floats; wrapping unconditionally
+    breaks ``np.mean``-style reduce_metrics and CPA unit assertions.
+    """
     try:
-        from verl.utils.metric import AggregationType, Metric
+        from verl.utils.metric import Metric
     except Exception:
         return float(value)
 
     pg = metrics.get("actor/pg_loss")
     if isinstance(pg, Metric):
         return Metric(aggregation=pg.aggregation, value=float(value))
-    return Metric(aggregation=AggregationType.MEAN, value=float(value))
+    return float(value)
 
 
 def _unwrap_non_tensor_value(val, default=None):
@@ -113,19 +117,10 @@ def _get_non_tensor(data, key: str, default=None):
     return default
 
 
-def _resolve_compute_device(loss: torch.Tensor, model_output: dict, device_name: str):
-    """Prefer verl's device id; fall back to student/loss tensors."""
-    try:
-        from verl.utils.device import get_device_id
-
-        return get_device_id()
-    except Exception:
-        pass
-
-    student = (model_output or {}).get("log_probs")
-    if torch.is_tensor(student):
-        return student.device
-    values = getattr(student, "values", None)
+def _tensor_device(obj) -> Optional[torch.device]:
+    if torch.is_tensor(obj):
+        return obj.device
+    values = getattr(obj, "values", None)
     if callable(values):
         try:
             vals = values()
@@ -133,11 +128,46 @@ def _resolve_compute_device(loss: torch.Tensor, model_output: dict, device_name:
                 return vals.device
         except Exception:
             pass
-    if torch.is_tensor(loss):
-        return loss.device
+    return None
+
+
+def _resolve_compute_device(loss: torch.Tensor, model_output: dict, device_name: str):
+    """Resolve the device for CPA teacher inputs / loss alignment.
+
+    Prefer the student log-prob device (where gradients live). Only fall back to
+    verl's ``get_device_id()`` when student tensors are unavailable — otherwise a
+    CUDA-capable host would pull CPU unit-test tensors onto ``cuda:0``.
+    """
+    student = (model_output or {}).get("log_probs")
+    student_device = _tensor_device(student)
+    if student_device is not None:
+        return student_device
+    loss_device = _tensor_device(loss)
+    if loss_device is not None:
+        return loss_device
+    try:
+        from verl.utils.device import get_device_id
+
+        return get_device_id()
+    except Exception:
+        pass
     if device_name == "cuda" and not torch.cuda.is_available():
         return torch.device("cpu")
     return torch.device(device_name)
+
+
+def _align_cpa_tensors(
+    student_log_prob: torch.Tensor,
+    teacher_log_prob: torch.Tensor,
+    response_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Ensure CPA inputs share the student log-prob device/dtype layout."""
+    device = student_log_prob.device
+    if teacher_log_prob.device != device:
+        teacher_log_prob = teacher_log_prob.to(device=device)
+    if response_mask.device != device:
+        response_mask = response_mask.to(device=device)
+    return student_log_prob, teacher_log_prob, response_mask
 
 
 def _move_micro_batch_to_device(micro_batch, device):
@@ -263,6 +293,9 @@ def augment_train_loss_with_cpa(
     teacher_log_prob = to_response_log_probs(teacher_raw, micro_batch).detach()
 
     response_mask = micro_batch["response_mask"]
+    student_log_prob, teacher_log_prob, response_mask = _align_cpa_tensors(
+        student_log_prob, teacher_log_prob, response_mask
+    )
     batch_num_tokens = _get_non_tensor(micro_batch, "batch_num_tokens", default=None)
     if batch_num_tokens is None:
         batch_num_tokens = float(response_mask.to(dtype=student_log_prob.dtype).sum().item())
